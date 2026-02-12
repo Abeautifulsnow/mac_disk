@@ -1,0 +1,37 @@
+[package]
+name = "mac_disk"
+version = "0.1.0"
+description = "macOS磁盘扫描工具"
+authors = ["Your Name"]
+license = ""
+repository = ""
+default-run = "mac_disk"
+edition = "2021"
+rust-version = "1.76"
+
+[build-dependencies]
+tauri-build = { version = "2.0", features = [] }
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tauri = { version = "2.0", features = [] }
+tauri-plugin-dialog = { version = "2.0", features = [] }
+tauri-plugin-shell = { version = "2.0" }
+walkdir = "2.5"  # 用于目录遍历
+tracing = "0.1"  # 日志记录
+rayon = "1.10"   # 并行处理
+lru = "0.12"     # LRU缓存
+uuid = { version = "1.10", features = ["v4", "serde"] }
+tokio = { version = "1.0", features = ["sync", "rt-multi-thread"] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+# 禁用devtools
+# [profile.dev]
+# opt-level = 0
+
+# [profile.release]
+# opt-level = 3

@@ -1,0 +1,1 @@
+{"main":{"identifier":"main","description":"Main capability for the macOS disk scanner application","local":true,"windows":["*"],"permissions":["core:default","dialog:allow-open"]}}

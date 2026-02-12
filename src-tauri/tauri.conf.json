@@ -1,0 +1,32 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "macOS磁盘扫描工具",
+  "version": "0.1.0",
+  "identifier": "com.macdisk.scanner",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "macOS磁盘扫描工具",
+        "width": 1200,
+        "height": 800,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": null,
+      "capabilities": ["main"]
+    }
+  },
+  "plugins": {
+    "shell": {
+      "open": true
+    },
+    "dialog": null
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pnpm create tauri-app:*)",
+      "Bash(cargo tauri init:*)",
+      "Bash(pnpm dlx:*)",
+      "Bash(npm create tauri-app:*)",
+      "Bash(pnpm install)",
+      "Bash(cargo build:*)",
+      "Bash(npx tsc:*)",
+      "Bash(pnpm run tauri:*)",
+      "Bash(pnpm add:*)",
+      "Bash(pnpm build:*)",
+      "Bash(cargo check:*)",
+      "Bash(npm run build:*)",
+      "Bash(pnpm tauri build:*)",
+      "Bash(pnpm dev:*)",
+      "Bash(timeout:*)",
+      "Bash(pnpm tauri dev:*)",
+      "Bash(find:*)"
+    ]
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "name": "mac-disk-scanner",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-dialog": "^2.0.0",
+    "clsx": "^2.1.1",
+    "lucide-react": "^0.475.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "tailwindcss": "^3.4.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.9.6",
+    "@types/node": "^25.0.6",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.1",
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.4.47",
+    "typescript": "~5.6.2",
+    "vite": "^5.4.8"
+  },
+  "packageManager": "pnpm@10.6.2+sha512.1ee9d5b0d893d1ee5f0bf79b2c6e2fb9a038f6bcb0d6c3b2209794cd4e572c86d4b42a1c1de8c5c2a93d6f88a9d908490b8b9ef3f2e15af48a6a0f3b3b5b3b8"
+}

@@ -18,8 +18,8 @@ export default function ConfirmDialog({
 }: ConfirmDialogProps) {
   if (!isOpen || !file) return null
 
-  const handleConfirm = () => {
-    onConfirm()
+  const handleConfirm = async () => {
+    await onConfirm()
     onClose()
   }
 

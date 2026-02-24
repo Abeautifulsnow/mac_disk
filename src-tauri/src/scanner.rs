@@ -284,25 +284,81 @@ where
     metrics.dir_calc_time = dir_calc_start.elapsed().as_nanos();
     metrics.files_processed = large_files.len();
 
-    let mut large_dirs: Vec<FileInfo> = Vec::new();
-    for (path, size) in dir_sizes {
-        if path == root {
-            continue;
-        }
+    // 使用层级贪心算法避免父级目录和子级目录同时出现
+    // 算法思路：按深度排序（从浅到深），对于每个目录，检查它的父目录是否已经在结果中
+    // 如果父目录已经在结果中，则跳过这个目录
+    // 如果这个目录本身在结果中，则它的所有子目录都会被跳过
 
-        if let Some(min) = min_size {
-            if size < min {
-                continue;
+    // 首先收集所有符合大小要求的目录
+    let mut all_dirs: Vec<(PathBuf, u64)> = dir_sizes
+        .into_iter()
+        .filter(|(path, _size)| *path != root)
+        .filter(|(_path, size)| {
+            if let Some(min) = min_size {
+                *size >= min
+            } else {
+                true
+            }
+        })
+        .collect::<Vec<_>>();
+
+    // 按深度排序（从浅到深），然后按大小排序
+    // 深度使用路径组件数量来估计
+    all_dirs.sort_by(|a, b| {
+        let depth_a = a.0.components().count();
+        let depth_b = b.0.components().count();
+        // 先按深度升序（更浅的先处理）
+        match depth_a.cmp(&depth_b) {
+            std::cmp::Ordering::Equal => b.1.cmp(&a.1), // 深度相同按大小降序
+            other => other,
+        }
+    });
+
+    // 使用 HashSet 记录已选择的目录路径
+    let mut selected_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut large_dirs: Vec<FileInfo> = Vec::new();
+
+    for (path, size) in all_dirs {
+        let path_str = path.to_string_lossy().to_string();
+
+        // 检查这个目录是否在某个已选择目录的子目录下
+        // 即：检查是否有已选择的目录是当前目录的父目录
+        let is_child_of_selected = selected_paths.iter().any(|selected| {
+            // 确保路径分隔符匹配，避免误判
+            // 例如：避免将 "/UserA" 误认为是 "/User" 的子目录
+            let selected_with_sep = if selected.ends_with('/') {
+                selected.clone()
+            } else {
+                format!("{}/", selected)
+            };
+            path_str.starts_with(&selected_with_sep)
+        });
+
+        if !is_child_of_selected {
+            // 这个目录不在任何已选择目录之下，选择它
+            if let Ok(info) = create_file_info(&path, size, true) {
+                large_dirs.push(info);
+                selected_paths.insert(path_str);
             }
         }
-
-        if let Ok(info) = create_file_info(&path, size, true) {
-            large_dirs.push(info);
-        }
+        // 否则，这个目录在已选择目录之下，跳过
     }
 
+    // 过滤大文件：只保留不在已选择目录下的文件
+    let filtered_large_files: Vec<FileInfo> = large_files
+        .into_iter()
+        .filter(|file| {
+            let file_path = &file.path;
+
+            // 检查文件路径是否在已选择的目录下
+            !selected_paths.iter().any(|selected| {
+                file_path.starts_with(selected)
+            })
+        })
+        .collect();
+
     let sort_start = Instant::now();
-    let mut final_files = large_files;
+    let mut final_files = filtered_large_files;
     let mut final_dirs = large_dirs;
     let total_files_found = final_files.len();
     let total_directories_found = final_dirs.len();

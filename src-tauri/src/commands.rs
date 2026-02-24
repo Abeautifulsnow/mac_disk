@@ -179,8 +179,9 @@ pub async fn scan_directory_parallel(options: ScanOptions) -> Result<Vec<FileInf
 }
 
 /// 删除文件或目录（需要前端二次确认）
+/// 使用 spawn_blocking 实现异步删除，避免阻塞 UI 线程
 #[command]
-pub async fn delete_path(path: String) -> Result<(), String> {
+pub async fn delete_path(path: String) -> Result<String, String> {
     let path_buf = PathBuf::from(&path);
 
     if !path_buf.exists() {
@@ -192,14 +193,32 @@ pub async fn delete_path(path: String) -> Result<(), String> {
         return Err("不允许删除系统关键路径".to_string());
     }
 
-    // 删除操作
-    if path_buf.is_dir() {
-        std::fs::remove_dir_all(&path_buf).map_err(|e| format!("删除目录失败: {}", e))?;
-    } else {
-        std::fs::remove_file(&path_buf).map_err(|e| format!("删除文件失败: {}", e))?;
-    }
+    // 获取文件/目录信息用于消息提示
+    let is_dir = path_buf.is_dir();
+    let file_name = path_buf
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.clone());
 
-    Ok(())
+    // 使用 spawn_blocking 在后台线程执行删除，避免阻塞 UI
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        if is_dir {
+            std::fs::remove_dir_all(&path_buf).map_err(|e| format!("删除目录失败: {}", e))
+        } else {
+            std::fs::remove_file(&path_buf).map_err(|e| format!("删除文件失败: {}", e))
+        }
+    })
+    .await
+    .map_err(|e| format!("删除任务执行失败: {}", e))?;
+
+    // 返回成功消息
+    match result {
+        Ok(()) => {
+            let item_type = if is_dir { "目录" } else { "文件" };
+            Ok(format!("{}: {} 已成功删除", item_type, file_name))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// 检查是否为敏感路径（系统关键目录）

@@ -83,6 +83,7 @@ pub enum ScanEvent {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct ScanProgress {
     pub scan_id: String,
     pub processed: usize,

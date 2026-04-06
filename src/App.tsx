@@ -29,6 +29,7 @@ function App() {
   } | null>(null);
   const [terminalState, setTerminalState] = useState<"timeout" | null>(null);
   const [lastTimeoutSeconds, setLastTimeoutSeconds] = useState<number>(300);
+  const [sizeMode, setSizeMode] = useState<"logical" | "disk">("logical");
 
   // 使用 ref 来跟踪最新的 currentScanId，避免闭包问题
   const currentScanIdRef = useRef<string | null>(null);
@@ -102,7 +103,7 @@ function App() {
               ).length;
               const derivedTotalSize = resultsForStats
                 .filter((x) => !x.is_dir)
-                .reduce((s, x) => s + x.size, 0);
+                .reduce((s, x) => s + x.sizeLogical, 0);
               setScanStats({
                 filesFound: Number(
                   payload.filesFound ?? derivedFilesFound ?? 0,
@@ -221,6 +222,7 @@ function App() {
           limit: limit > 0 ? limit : null,
           minSize: minSize > 0 ? minSize * 1024 * 1024 : null, // 转换为字节
           timeoutSeconds: timeoutSeconds >= 0 ? timeoutSeconds : null,
+          sizeMode,
         },
       });
       console.log("扫描已启动，scanId:", scanId);
@@ -321,10 +323,12 @@ function App() {
     return `${size.toFixed(2)} ${units[unitIndex]}`;
   };
 
-  const displayedSize = files.reduce((sum, file) => sum + file.size, 0);
-  const scannedTotalSize = scanStats?.totalSize ?? 0;
-  const headerTotalSize =
-    scanStats && scannedTotalSize > 0 ? scannedTotalSize : displayedSize;
+  const displayedSize = files.reduce(
+    (sum, file) =>
+      sum + (sizeMode === "disk" ? file.sizeDisk : file.sizeLogical),
+    0,
+  );
+  const headerTotalSize = displayedSize;
   const totalItems =
     (scanStats?.filesFound ?? 0) + (scanStats?.directoriesFound ?? 0);
 
@@ -378,6 +382,8 @@ function App() {
               cancelPending={cancelPending}
               progress={scanProgress}
               canCancel={!!currentScanId}
+              sizeMode={sizeMode}
+              onSizeModeChange={setSizeMode}
             />
           </div>
 
@@ -409,6 +415,7 @@ function App() {
                 files={files}
                 onDelete={handleDelete}
                 formatFileSize={formatFileSize}
+                sizeMode={sizeMode}
               />
             ) : (
               <div className="text-center py-12">
@@ -429,6 +436,7 @@ function App() {
         onConfirm={confirmDeleteAction}
         file={confirmDelete}
         formatFileSize={formatFileSize}
+        sizeMode={sizeMode}
       />
     </div>
   );

@@ -5,9 +5,10 @@ interface FileListProps {
   files: FileInfo[]
   onDelete: (file: FileInfo) => void
   formatFileSize: (bytes: number) => string
+  sizeMode: "logical" | "disk"
 }
 
-export default function FileList({ files, onDelete, formatFileSize }: FileListProps) {
+export default function FileList({ files, onDelete, formatFileSize, sizeMode }: FileListProps) {
   const formatDate = (timestamp: number | null): string => {
     if (!timestamp) return '未知'
     const date = new Date(timestamp * 1000)
@@ -73,9 +74,9 @@ export default function FileList({ files, onDelete, formatFileSize }: FileListPr
                 <div className="px-4 py-4 whitespace-nowrap border-b border-gray-200 group-hover:bg-gray-50">
                   <div className="inline-flex items-center gap-2 flex-nowrap">
                     <span className="text-sm font-semibold text-gray-900">
-                      {formatFileSize(file.size)}
+                      {formatFileSize(sizeMode === "disk" ? file.sizeDisk : file.sizeLogical)}
                     </span>
-                    {file.size > 1024 * 1024 * 100 && (
+                    {(sizeMode === "disk" ? file.sizeDisk : file.sizeLogical) > 1024 * 1024 * 100 && (
                       <span className="hidden xl:inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-red-100 text-red-800 whitespace-nowrap">
                         <AlertTriangle className="h-3 w-3 mr-1" />
                         大文件

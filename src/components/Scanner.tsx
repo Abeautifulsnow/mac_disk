@@ -11,9 +11,11 @@ interface ScannerProps {
   cancelPending?: boolean
   progress?: ScanProgress | null
   canCancel?: boolean
+  sizeMode: "logical" | "disk"
+  onSizeModeChange: (mode: "logical" | "disk") => void
 }
 
-export default function Scanner({ onScan, onCancel, loading, cancelPending = false, progress, canCancel = false }: ScannerProps) {
+export default function Scanner({ onScan, onCancel, loading, cancelPending = false, progress, canCancel = false, sizeMode, onSizeModeChange }: ScannerProps) {
   const [path, setPath] = useState('/Users')
   const [limit, setLimit] = useState(50)
   const [minSize, setMinSize] = useState(10) // MB
@@ -187,6 +189,41 @@ export default function Scanner({ onScan, onCancel, loading, cancelPending = fal
           </div>
           <p className="mt-1 text-xs text-gray-500">
             目录很大时建议调高，避免自动超时退出
+          </p>
+        </div>
+
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-2">
+            大小计算方式
+          </label>
+          <div className="flex rounded-lg border border-gray-300 overflow-hidden">
+            <button
+              type="button"
+              onClick={() => onSizeModeChange("logical")}
+              className={`flex-1 px-3 py-2 text-sm font-medium transition-colors ${
+                sizeMode === "logical"
+                  ? "bg-blue-600 text-white"
+                  : "bg-white text-gray-700 hover:bg-gray-50"
+              }`}
+            >
+              逻辑大小
+            </button>
+            <button
+              type="button"
+              onClick={() => onSizeModeChange("disk")}
+              className={`flex-1 px-3 py-2 text-sm font-medium transition-colors border-l border-gray-300 ${
+                sizeMode === "disk"
+                  ? "bg-blue-600 text-white"
+                  : "bg-white text-gray-700 hover:bg-gray-50"
+              }`}
+            >
+              磁盘使用量
+            </button>
+          </div>
+          <p className="mt-1 text-xs text-gray-500">
+            {sizeMode === "logical"
+              ? "显示文件实际内容大小（与 du -sh 可能不同）"
+              : "显示文件在磁盘上占用的空间（与 du -sh 一致）"}
           </p>
         </div>
 

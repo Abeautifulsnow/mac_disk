@@ -1,9 +1,10 @@
 export interface FileInfo {
   path: string;
-  size: number;
+  sizeLogical: number;
   is_dir: boolean;
   modified: number | null;
   name: string;
+  sizeDisk: number;
 }
 
 export interface ScanOptions {
@@ -11,6 +12,7 @@ export interface ScanOptions {
   limit?: number | null;
   minSize?: number | null;
   timeoutSeconds?: number | null;
+  sizeMode?: "logical" | "disk" | null;
 }
 
 export type ScanEvent =

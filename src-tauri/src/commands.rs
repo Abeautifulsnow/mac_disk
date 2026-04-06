@@ -14,19 +14,23 @@ use uuid::Uuid;
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FileInfo {
     pub path: String,
-    pub size: u64,
+    #[serde(rename = "sizeLogical")]
+    pub size_logical: u64,
     pub is_dir: bool,
-    pub modified: Option<u64>, // 时间戳
+    pub modified: Option<u64>,
     pub name: String,
+    #[serde(rename = "sizeDisk")]
+    pub size_disk: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScanOptions {
     pub path: String,
-    pub limit: Option<usize>,  // 限制返回的项目数量
-    pub min_size: Option<u64>, // 最小文件大小（字节）
+    pub limit: Option<usize>,
+    pub min_size: Option<u64>,
     pub timeout_seconds: Option<u64>,
+    pub size_mode: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -151,7 +155,7 @@ pub async fn scan_directory(options: ScanOptions) -> Result<Vec<FileInfo>, Strin
     }
 
     // 调用扫描逻辑
-    let items = scanner::scan_directory(&path, options.limit, options.min_size)
+    let items = scanner::scan_directory(&path, options.limit, options.min_size, options.size_mode.as_deref())
         .map_err(|e| format!("扫描失败: {}", e))?;
 
     Ok(items)
@@ -172,7 +176,7 @@ pub async fn scan_directory_parallel(options: ScanOptions) -> Result<Vec<FileInf
     }
 
     // 调用并行扫描逻辑
-    let items = scanner::scan_directory_parallel(&path, options.limit, options.min_size)
+    let items = scanner::scan_directory_parallel(&path, options.limit, options.min_size, options.size_mode.as_deref())
         .map_err(|e| format!("并行扫描失败: {}", e))?;
 
     Ok(items)
@@ -314,6 +318,7 @@ pub async fn scan_directory_with_progress(
     let path_clone = path.clone();
     let limit = options.limit;
     let min_size = options.min_size;
+    let size_mode = options.size_mode.clone();
 
     // 创建通道用于从阻塞线程发送事件到异步任务
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<ScanEvent>();
@@ -378,6 +383,7 @@ pub async fn scan_directory_with_progress(
             min_size,
             cancel_flag,
             scan_id_clone.clone(),
+            size_mode.as_deref(),
             move |event| {
                 // 通过通道发送事件
                 tracing::debug!("[{}] 通过回调发送事件: {:?}", scan_id_for_closure, event);

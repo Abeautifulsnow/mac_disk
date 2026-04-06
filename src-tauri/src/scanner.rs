@@ -1,6 +1,7 @@
 use crate::commands::{FileInfo, ScanEvent};
 use rayon::prelude::*;
 use std::collections::HashMap;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -57,6 +58,7 @@ pub fn scan_directory(
     root: &Path,
     limit: Option<usize>,
     min_size: Option<u64>,
+    size_mode: Option<&str>,
 ) -> Result<Vec<FileInfo>, Box<dyn std::error::Error>> {
     let cancel_flag = Arc::new(AtomicBool::new(false));
     let (files, dirs, _) = scan_directory_with_progress(
@@ -65,6 +67,7 @@ pub fn scan_directory(
         min_size,
         cancel_flag,
         "internal".to_string(),
+        size_mode,
         |_| Ok(()),
     )?;
 
@@ -80,8 +83,9 @@ pub fn scan_directory_parallel(
     root: &Path,
     limit: Option<usize>,
     min_size: Option<u64>,
+    size_mode: Option<&str>,
 ) -> Result<Vec<FileInfo>, Box<dyn std::error::Error>> {
-    scan_directory(root, limit, min_size)
+    scan_directory(root, limit, min_size, size_mode)
 }
 
 /// 带进度跟踪和取消支持的目录扫描（高性能重构版）
@@ -91,6 +95,7 @@ pub fn scan_directory_with_progress<F>(
     min_size: Option<u64>,
     cancel_flag: Arc<AtomicBool>,
     scan_id: String,
+    size_mode: Option<&str>,
     mut progress_callback: F,
 ) -> Result<(Vec<FileInfo>, Vec<FileInfo>, u64), Box<dyn std::error::Error>>
 where
@@ -158,9 +163,10 @@ where
         phase: Some("processing".to_string()),
     })?;
 
-    let mut dir_sizes: HashMap<PathBuf, u64> = HashMap::new();
+    let mut dir_sizes: HashMap<PathBuf, (u64, u64)> = HashMap::new();
     let mut large_files: Vec<FileInfo> = Vec::new();
-    let mut total_size: u64 = 0;
+    let mut total_logical_size: u64 = 0;
+    let mut total_disk_usage: u64 = 0;
 
     let dir_calc_start = Instant::now();
     let mut processed = 0usize;
@@ -177,8 +183,9 @@ where
         #[derive(Default)]
         struct ChunkAcc {
             files: Vec<FileInfo>,
-            dirs: HashMap<PathBuf, u64>,
-            total_size: u64,
+            dirs: HashMap<PathBuf, (u64, u64)>,
+            total_logical_size: u64,
+            total_disk_usage: u64,
             skipped: usize,
         }
 
@@ -211,7 +218,16 @@ where
                 }
 
                 let size = metadata.len();
-                acc.total_size = acc.total_size.saturating_add(size);
+                let disk_usage = {
+                    let blocks = metadata.blocks();
+                    if blocks == 0 {
+                        size
+                    } else {
+                        blocks * 512
+                    }
+                };
+                acc.total_logical_size = acc.total_logical_size.saturating_add(size);
+                acc.total_disk_usage = acc.total_disk_usage.saturating_add(disk_usage);
 
                 let mut current = entry.path().parent();
                 while let Some(parent) = current {
@@ -219,8 +235,9 @@ where
                         break;
                     }
                     let key = parent.to_path_buf();
-                    let v = acc.dirs.entry(key).or_insert(0);
-                    *v = v.saturating_add(size);
+                    let v = acc.dirs.entry(key).or_insert((0, 0));
+                    v.0 = v.0.saturating_add(size);
+                    v.1 = v.1.saturating_add(disk_usage);
                     if parent == root {
                         break;
                     }
@@ -239,11 +256,13 @@ where
             })
             .try_reduce(ChunkAcc::default, |mut a, mut b| {
                 a.files.append(&mut b.files);
-                a.total_size = a.total_size.saturating_add(b.total_size);
+                a.total_logical_size = a.total_logical_size.saturating_add(b.total_logical_size);
+                a.total_disk_usage = a.total_disk_usage.saturating_add(b.total_disk_usage);
                 a.skipped += b.skipped;
                 for (k, v) in b.dirs {
-                    let e = a.dirs.entry(k).or_insert(0);
-                    *e = e.saturating_add(v);
+                    let e = a.dirs.entry(k).or_insert((0, 0));
+                    e.0 = e.0.saturating_add(v.0);
+                    e.1 = e.1.saturating_add(v.1);
                 }
                 Ok(a)
             });
@@ -251,11 +270,13 @@ where
         match chunk_result {
             Ok(acc) => {
                 large_files.extend(acc.files);
-                total_size = total_size.saturating_add(acc.total_size);
+                total_logical_size = total_logical_size.saturating_add(acc.total_logical_size);
+                total_disk_usage = total_disk_usage.saturating_add(acc.total_disk_usage);
                 metrics.skipped_entries += acc.skipped;
                 for (k, v) in acc.dirs {
-                    let entry = dir_sizes.entry(k).or_insert(0);
-                    *entry = entry.saturating_add(v);
+                    let entry = dir_sizes.entry(k).or_insert((0, 0));
+                    entry.0 = entry.0.saturating_add(v.0);
+                    entry.1 = entry.1.saturating_add(v.1);
                 }
             }
             Err(_) => {
@@ -290,16 +311,17 @@ where
     // 如果这个目录本身在结果中，则它的所有子目录都会被跳过
 
     // 首先收集所有符合大小要求的目录
-    let mut all_dirs: Vec<(PathBuf, u64)> = dir_sizes
+    let mut all_dirs: Vec<(PathBuf, u64, u64)> = dir_sizes
         .into_iter()
-        .filter(|(path, _size)| *path != root)
-        .filter(|(_path, size)| {
+        .filter(|(path, _sizes)| *path != root)
+        .filter(|(_path, sizes)| {
             if let Some(min) = min_size {
-                *size >= min
+                sizes.0 >= min
             } else {
                 true
             }
         })
+        .map(|(path, sizes)| (path, sizes.0, sizes.1))
         .collect::<Vec<_>>();
 
     // 按深度排序（从浅到深），然后按大小排序
@@ -307,9 +329,8 @@ where
     all_dirs.sort_by(|a, b| {
         let depth_a = a.0.components().count();
         let depth_b = b.0.components().count();
-        // 先按深度升序（更浅的先处理）
         match depth_a.cmp(&depth_b) {
-            std::cmp::Ordering::Equal => b.1.cmp(&a.1), // 深度相同按大小降序
+            std::cmp::Ordering::Equal => b.1.cmp(&a.1),
             other => other,
         }
     });
@@ -318,7 +339,7 @@ where
     let mut selected_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut large_dirs: Vec<FileInfo> = Vec::new();
 
-    for (path, size) in all_dirs {
+    for (path, size, disk_usage) in all_dirs {
         let path_str = path.to_string_lossy().to_string();
 
         // 检查这个目录是否在某个已选择目录的子目录下
@@ -336,7 +357,7 @@ where
 
         if !is_child_of_selected {
             // 这个目录不在任何已选择目录之下，选择它
-            if let Ok(info) = create_file_info(&path, size, true) {
+            if let Ok(info) = create_file_info_with_sizes(&path, size, disk_usage, true) {
                 large_dirs.push(info);
                 selected_paths.insert(path_str);
             }
@@ -351,9 +372,9 @@ where
             let file_path = &file.path;
 
             // 检查文件路径是否在已选择的目录下
-            !selected_paths.iter().any(|selected| {
-                file_path.starts_with(selected)
-            })
+            !selected_paths
+                .iter()
+                .any(|selected| file_path.starts_with(selected))
         })
         .collect();
 
@@ -363,8 +384,8 @@ where
     let total_files_found = final_files.len();
     let total_directories_found = final_dirs.len();
 
-    final_files.sort_by(|a, b| b.size.cmp(&a.size));
-    final_dirs.sort_by(|a, b| b.size.cmp(&a.size));
+    final_files.sort_by(|a, b| b.size_logical.cmp(&a.size_logical));
+    final_dirs.sort_by(|a, b| b.size_logical.cmp(&a.size_logical));
 
     if let Some(l) = limit {
         if final_files.len() > l {
@@ -379,9 +400,15 @@ where
     metrics.finish();
     metrics.log_summary();
 
+    let total_size = if size_mode == Some("disk") {
+        total_disk_usage
+    } else {
+        total_logical_size
+    };
+
     let mut results = final_files.clone();
     results.extend(final_dirs.clone());
-    results.sort_by(|a, b| b.size.cmp(&a.size));
+    results.sort_by(|a, b| b.size_logical.cmp(&a.size_logical));
 
     progress_callback(ScanEvent::Completed {
         scan_id: scan_id.clone(),
@@ -411,12 +438,22 @@ fn create_file_info_from_metadata(
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| path.to_string_lossy().to_string());
 
+    let disk_usage = {
+        let blocks = metadata.blocks();
+        if blocks == 0 {
+            size
+        } else {
+            blocks * 512
+        }
+    };
+
     Ok(FileInfo {
         path: path.to_string_lossy().to_string(),
-        size,
+        size_logical: size,
         is_dir,
         modified,
         name,
+        size_disk: disk_usage,
     })
 }
 
@@ -425,23 +462,57 @@ fn create_file_info(
     size: u64,
     is_dir: bool,
 ) -> Result<FileInfo, Box<dyn std::error::Error>> {
-    // 这里我们可能无法再次获取 metadata 如果文件被删除了，或者为了性能我们不应该再次获取。
-    // 但对于目录，我们没有保留原始 metadata。
-    // 重新获取 metadata 是可以接受的，因为目录数量远少于文件。
     match std::fs::metadata(path) {
         Ok(metadata) => create_file_info_from_metadata(path, size, is_dir, &metadata),
-        Err(_) => {
-            // 如果无法读取元数据，手动构造一个基本信息
+        Err(_) => Ok(FileInfo {
+            path: path.to_string_lossy().to_string(),
+            size_logical: size,
+            is_dir,
+            modified: None,
+            name: path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            size_disk: size,
+        }),
+    }
+}
+
+fn create_file_info_with_sizes(
+    path: &Path,
+    size_logical: u64,
+    size_disk: u64,
+    is_dir: bool,
+) -> Result<FileInfo, Box<dyn std::error::Error>> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => {
+            let modified = metadata
+                .modified()
+                .ok()
+                .map(|t| t.duration_since(UNIX_EPOCH).unwrap().as_secs());
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.to_string_lossy().to_string());
             Ok(FileInfo {
                 path: path.to_string_lossy().to_string(),
-                size,
+                size_logical,
                 is_dir,
-                modified: None,
-                name: path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default(),
+                modified,
+                name,
+                size_disk,
             })
         }
+        Err(_) => Ok(FileInfo {
+            path: path.to_string_lossy().to_string(),
+            size_logical,
+            is_dir,
+            modified: None,
+            name: path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            size_disk,
+        }),
     }
 }

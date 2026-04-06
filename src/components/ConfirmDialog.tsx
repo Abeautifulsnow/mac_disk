@@ -7,6 +7,7 @@ interface ConfirmDialogProps {
   onConfirm: () => void
   file: FileInfo | null
   formatFileSize: (bytes: number) => string
+  sizeMode: "logical" | "disk"
 }
 
 export default function ConfirmDialog({
@@ -14,7 +15,8 @@ export default function ConfirmDialog({
   onClose,
   onConfirm,
   file,
-  formatFileSize
+  formatFileSize,
+  sizeMode
 }: ConfirmDialogProps) {
   if (!isOpen || !file) return null
 
@@ -57,7 +59,7 @@ export default function ConfirmDialog({
                         </div>
                       </div>
                       <div className="text-sm font-semibold text-red-600">
-                        {formatFileSize(file.size)}
+                        {formatFileSize(sizeMode === "disk" ? file.sizeDisk : file.sizeLogical)}
                       </div>
                     </div>
                     <div className="mt-3 flex items-center space-x-2">

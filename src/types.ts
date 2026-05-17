@@ -33,6 +33,8 @@ export type ScanEvent =
       filesFound: number;
       directoriesFound: number;
       totalSize: number;
+      totalSizeLogical?: number;
+      totalSizeDisk?: number;
       results: FileInfo[];
     }
   | { type: "cancelled"; scanId: string }

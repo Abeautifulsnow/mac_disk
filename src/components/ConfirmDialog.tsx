@@ -41,11 +41,11 @@ export default function ConfirmDialog({
               </div>
               <div className="mt-3 text-center sm:mt-0 sm:ml-4 sm:text-left">
                 <h3 className="text-lg font-medium leading-6 text-gray-900">
-                  确认删除
+                  移到废纸篓
                 </h3>
                 <div className="mt-2">
                   <p className="text-sm text-gray-500">
-                    您确定要删除以下项目吗？此操作无法撤销。
+                    您确定要将以下项目移到废纸篓吗？
                   </p>
 
                   <div className="mt-4 rounded-lg bg-gray-50 p-4">
@@ -79,12 +79,12 @@ export default function ConfirmDialog({
                     <div className="flex">
                       <AlertTriangle className="h-5 w-5 text-red-400 flex-shrink-0" />
                       <div className="ml-3">
-                        <h4 className="text-sm font-medium text-red-800">警告</h4>
+                        <h4 className="text-sm font-medium text-red-800">注意</h4>
                         <div className="mt-1 text-sm text-red-700">
                           {file.is_dir ? (
-                            <p>删除目录将同时删除其中的所有文件和子目录。</p>
+                            <p>目录及其中的所有文件和子目录会一起移到废纸篓。</p>
                           ) : (
-                            <p>删除的文件将无法恢复。</p>
+                            <p>项目会进入废纸篓，可在 Finder 中恢复或清倒。</p>
                           )}
                         </div>
                       </div>
@@ -101,7 +101,7 @@ export default function ConfirmDialog({
               className="inline-flex w-full justify-center rounded-md border border-transparent bg-red-600 px-4 py-2 text-base font-medium text-white shadow-sm hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2 sm:ml-3 sm:w-auto sm:text-sm"
             >
               <Trash2 className="h-4 w-4 mr-2" />
-              确认删除
+              移到废纸篓
             </button>
             <button
               type="button"

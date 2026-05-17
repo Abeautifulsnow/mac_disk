@@ -167,6 +167,7 @@ where
     let mut large_files: Vec<FileInfo> = Vec::new();
     let mut total_logical_size: u64 = 0;
     let mut total_disk_usage: u64 = 0;
+    let use_disk_mode = size_mode == Some("disk");
 
     let dir_calc_start = Instant::now();
     let mut processed = 0usize;
@@ -244,7 +245,8 @@ where
                     current = parent.parent();
                 }
 
-                if min_size.map_or(true, |min| size >= min) {
+                let active_size = if use_disk_mode { disk_usage } else { size };
+                if min_size.map_or(true, |min| active_size >= min) {
                     if let Ok(info) =
                         create_file_info_from_metadata(entry.path(), size, false, &metadata)
                     {
@@ -305,96 +307,90 @@ where
     metrics.dir_calc_time = dir_calc_start.elapsed().as_nanos();
     metrics.files_processed = large_files.len();
 
-    // 使用层级贪心算法避免父级目录和子级目录同时出现
-    // 算法思路：按深度排序（从浅到深），对于每个目录，检查它的父目录是否已经在结果中
-    // 如果父目录已经在结果中，则跳过这个目录
-    // 如果这个目录本身在结果中，则它的所有子目录都会被跳过
-
-    // 首先收集所有符合大小要求的目录
+    // 收集符合大小要求的目录。前端现在会构建可展开树形表格，
+    // 因此不能再过滤掉已选父目录下面的子项。
     let mut all_dirs: Vec<(PathBuf, u64, u64)> = dir_sizes
-        .into_iter()
+        .iter()
         .filter(|(path, _sizes)| *path != root)
         .filter(|(_path, sizes)| {
             if let Some(min) = min_size {
-                sizes.0 >= min
+                if use_disk_mode {
+                    sizes.1 >= min
+                } else {
+                    sizes.0 >= min
+                }
             } else {
                 true
             }
         })
-        .map(|(path, sizes)| (path, sizes.0, sizes.1))
+        .map(|(path, sizes)| (path.clone(), sizes.0, sizes.1))
         .collect::<Vec<_>>();
 
-    // 按深度排序（从浅到深），然后按大小排序
-    // 深度使用路径组件数量来估计
-    all_dirs.sort_by(|a, b| {
-        let depth_a = a.0.components().count();
-        let depth_b = b.0.components().count();
-        match depth_a.cmp(&depth_b) {
-            std::cmp::Ordering::Equal => b.1.cmp(&a.1),
-            other => other,
+    let sort_start = Instant::now();
+    let active_tuple_size = |logical: u64, disk: u64| if use_disk_mode { disk } else { logical };
+    let active_file_size = |file: &FileInfo| {
+        if use_disk_mode {
+            file.size_disk
+        } else {
+            file.size_logical
         }
+    };
+
+    all_dirs.sort_by(|a, b| {
+        active_tuple_size(b.1, b.2)
+            .cmp(&active_tuple_size(a.1, a.2))
+            .then_with(|| a.0.cmp(&b.0))
     });
 
-    // 使用 HashSet 记录已选择的目录路径
-    let mut selected_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut large_dirs: Vec<FileInfo> = Vec::new();
+    large_files.sort_by(|a, b| {
+        active_file_size(b)
+            .cmp(&active_file_size(a))
+            .then_with(|| a.path.cmp(&b.path))
+    });
 
-    for (path, size, disk_usage) in all_dirs {
-        let path_str = path.to_string_lossy().to_string();
+    let total_files_found = large_files.len();
+    let total_directories_found = all_dirs.len();
 
-        // 检查这个目录是否在某个已选择目录的子目录下
-        // 即：检查是否有已选择的目录是当前目录的父目录
-        let is_child_of_selected = selected_paths.iter().any(|selected| {
-            // 确保路径分隔符匹配，避免误判
-            // 例如：避免将 "/UserA" 误认为是 "/User" 的子目录
-            let selected_with_sep = if selected.ends_with('/') {
-                selected.clone()
-            } else {
-                format!("{}/", selected)
-            };
-            path_str.starts_with(&selected_with_sep)
-        });
-
-        if !is_child_of_selected {
-            // 这个目录不在任何已选择目录之下，选择它
-            if let Ok(info) = create_file_info_with_sizes(&path, size, disk_usage, true) {
-                large_dirs.push(info);
-                selected_paths.insert(path_str);
-            }
-        }
-        // 否则，这个目录在已选择目录之下，跳过
+    let mut final_files = large_files;
+    if let Some(l) = limit {
+        final_files.truncate(l);
     }
 
-    // 过滤大文件：只保留不在已选择目录下的文件
-    let filtered_large_files: Vec<FileInfo> = large_files
-        .into_iter()
-        .filter(|file| {
-            let file_path = &file.path;
+    let selected_dir_entries = if let Some(l) = limit {
+        all_dirs.into_iter().take(l).collect::<Vec<_>>()
+    } else {
+        all_dirs
+    };
 
-            // 检查文件路径是否在已选择的目录下
-            !selected_paths
-                .iter()
-                .any(|selected| file_path.starts_with(selected))
+    let mut final_dirs: Vec<FileInfo> = selected_dir_entries
+        .into_iter()
+        .filter_map(|(path, size, disk_usage)| {
+            create_file_info_with_sizes(&path, size, disk_usage, true).ok()
         })
         .collect();
 
-    let sort_start = Instant::now();
-    let mut final_files = filtered_large_files;
-    let mut final_dirs = large_dirs;
-    let total_files_found = final_files.len();
-    let total_directories_found = final_dirs.len();
+    let mut result_by_path: HashMap<String, FileInfo> = HashMap::new();
 
-    final_files.sort_by(|a, b| b.size_logical.cmp(&a.size_logical));
-    final_dirs.sort_by(|a, b| b.size_logical.cmp(&a.size_logical));
-
-    if let Some(l) = limit {
-        if final_files.len() > l {
-            final_files.truncate(l);
-        }
-        if final_dirs.len() > l {
-            final_dirs.truncate(l);
-        }
+    for dir in &final_dirs {
+        result_by_path.insert(dir.path.clone(), dir.clone());
+        add_ancestor_dirs(Path::new(&dir.path), root, &dir_sizes, &mut result_by_path);
     }
+
+    for file in &final_files {
+        result_by_path.insert(file.path.clone(), file.clone());
+        add_ancestor_dirs(Path::new(&file.path), root, &dir_sizes, &mut result_by_path);
+    }
+
+    final_dirs = result_by_path
+        .values()
+        .filter(|item| item.is_dir)
+        .cloned()
+        .collect();
+    final_dirs.sort_by(|a, b| {
+        active_file_size(b)
+            .cmp(&active_file_size(a))
+            .then_with(|| a.path.cmp(&b.path))
+    });
     metrics.sorting_time = sort_start.elapsed().as_nanos();
 
     metrics.finish();
@@ -408,17 +404,47 @@ where
 
     let mut results = final_files.clone();
     results.extend(final_dirs.clone());
-    results.sort_by(|a, b| b.size_logical.cmp(&a.size_logical));
+    results.sort_by(|a, b| {
+        active_file_size(b)
+            .cmp(&active_file_size(a))
+            .then_with(|| a.path.cmp(&b.path))
+    });
 
     progress_callback(ScanEvent::Completed {
         scan_id: scan_id.clone(),
         files_found: total_files_found,
         directories_found: total_directories_found,
         total_size,
+        total_size_logical: total_logical_size,
+        total_size_disk: total_disk_usage,
         results,
     })?;
 
     Ok((final_files, final_dirs, total_size))
+}
+
+fn add_ancestor_dirs(
+    item_path: &Path,
+    root: &Path,
+    dir_sizes: &HashMap<PathBuf, (u64, u64)>,
+    result_by_path: &mut HashMap<String, FileInfo>,
+) {
+    let mut current = item_path.parent();
+
+    while let Some(parent) = current {
+        if parent == root || !parent.starts_with(root) {
+            break;
+        }
+
+        if let Some((size_logical, size_disk)) = dir_sizes.get(parent) {
+            if let Ok(info) = create_file_info_with_sizes(parent, *size_logical, *size_disk, true)
+            {
+                result_by_path.entry(info.path.clone()).or_insert(info);
+            }
+        }
+
+        current = parent.parent();
+    }
 }
 
 /// 辅助函数：创建 FileInfo
@@ -455,27 +481,6 @@ fn create_file_info_from_metadata(
         name,
         size_disk: disk_usage,
     })
-}
-
-fn create_file_info(
-    path: &Path,
-    size: u64,
-    is_dir: bool,
-) -> Result<FileInfo, Box<dyn std::error::Error>> {
-    match std::fs::metadata(path) {
-        Ok(metadata) => create_file_info_from_metadata(path, size, is_dir, &metadata),
-        Err(_) => Ok(FileInfo {
-            path: path.to_string_lossy().to_string(),
-            size_logical: size,
-            is_dir,
-            modified: None,
-            name: path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default(),
-            size_disk: size,
-        }),
-    }
 }
 
 fn create_file_info_with_sizes(

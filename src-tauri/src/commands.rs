@@ -2,6 +2,7 @@ use crate::scanner;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Mutex;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -68,6 +69,10 @@ pub enum ScanEvent {
         directories_found: usize,
         #[serde(rename = "totalSize")]
         total_size: u64,
+        #[serde(rename = "totalSizeLogical")]
+        total_size_logical: u64,
+        #[serde(rename = "totalSizeDisk")]
+        total_size_disk: u64,
         // 新增字段
         results: Vec<FileInfo>,
     },
@@ -182,8 +187,8 @@ pub async fn scan_directory_parallel(options: ScanOptions) -> Result<Vec<FileInf
     Ok(items)
 }
 
-/// 删除文件或目录（需要前端二次确认）
-/// 使用 spawn_blocking 实现异步删除，避免阻塞 UI 线程
+/// 将文件或目录移到废纸篓（需要前端二次确认）
+/// 使用 spawn_blocking 实现异步操作，避免阻塞 UI 线程
 #[command]
 pub async fn delete_path(path: String) -> Result<String, String> {
     let path_buf = PathBuf::from(&path);
@@ -204,25 +209,70 @@ pub async fn delete_path(path: String) -> Result<String, String> {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| path.clone());
 
-    // 使用 spawn_blocking 在后台线程执行删除，避免阻塞 UI
+    // 使用 spawn_blocking 在后台线程执行 Finder 删除，避免阻塞 UI
     let result = tauri::async_runtime::spawn_blocking(move || {
-        if is_dir {
-            std::fs::remove_dir_all(&path_buf).map_err(|e| format!("删除目录失败: {}", e))
+        let script = r#"
+on run argv
+  tell application "Finder"
+    delete POSIX file (item 1 of argv)
+  end tell
+end run
+"#;
+        let output = Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .arg(path_buf.to_string_lossy().to_string())
+            .output()
+            .map_err(|e| format!("无法调用 Finder: {}", e))?;
+
+        if output.status.success() {
+            Ok(())
         } else {
-            std::fs::remove_file(&path_buf).map_err(|e| format!("删除文件失败: {}", e))
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            Err(if stderr.is_empty() {
+                "移到废纸篓失败".to_string()
+            } else {
+                format!("移到废纸篓失败: {}", stderr)
+            })
         }
     })
     .await
-    .map_err(|e| format!("删除任务执行失败: {}", e))?;
+    .map_err(|e| format!("移到废纸篓任务执行失败: {}", e))?;
 
     // 返回成功消息
     match result {
         Ok(()) => {
             let item_type = if is_dir { "目录" } else { "文件" };
-            Ok(format!("{}: {} 已成功删除", item_type, file_name))
+            Ok(format!("{}: {} 已移到废纸篓", item_type, file_name))
         }
         Err(e) => Err(e),
     }
+}
+
+/// 在 Finder 中显示文件或目录
+#[command]
+pub async fn show_in_finder(path: String) -> Result<(), String> {
+    let path_buf = PathBuf::from(&path);
+
+    if !path_buf.exists() {
+        return Err("路径不存在".to_string());
+    }
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let status = Command::new("open")
+            .arg("-R")
+            .arg(path_buf)
+            .status()
+            .map_err(|e| format!("无法打开 Finder: {}", e))?;
+
+        if status.success() {
+            Ok(())
+        } else {
+            Err("Finder 打开失败".to_string())
+        }
+    })
+    .await
+    .map_err(|e| format!("Finder 任务执行失败: {}", e))?
 }
 
 /// 检查是否为敏感路径（系统关键目录）

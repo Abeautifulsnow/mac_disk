@@ -25,15 +25,23 @@ function App() {
   const [scanStats, setScanStats] = useState<{
     filesFound: number;
     directoriesFound: number;
-    totalSize: number;
+    totalSizeLogical: number;
+    totalSizeDisk: number;
   } | null>(null);
   const [terminalState, setTerminalState] = useState<"timeout" | null>(null);
   const [lastTimeoutSeconds, setLastTimeoutSeconds] = useState<number>(300);
   const [sizeMode, setSizeMode] = useState<"logical" | "disk">("logical");
+  const [scanRoot, setScanRoot] = useState("/Users");
 
   // 使用 ref 来跟踪最新的 currentScanId，避免闭包问题
   const currentScanIdRef = useRef<string | null>(null);
   const terminalStateRef = useRef<"timeout" | null>(null);
+  const scanSizeModeRef = useRef<"logical" | "disk">("logical");
+  const lastScanOptionsRef = useRef({
+    limit: 50,
+    minSize: 10,
+    timeoutSeconds: 300,
+  });
 
   // 同步 ref 和 state
   useEffect(() => {
@@ -101,9 +109,16 @@ function App() {
               const derivedDirectoriesFound = resultsForStats.filter(
                 (x) => x.is_dir,
               ).length;
-              const derivedTotalSize = resultsForStats
+              const derivedTotalSizeLogical = resultsForStats
                 .filter((x) => !x.is_dir)
                 .reduce((s, x) => s + x.sizeLogical, 0);
+              const derivedTotalSizeDisk = resultsForStats
+                .filter((x) => !x.is_dir)
+                .reduce((s, x) => s + x.sizeDisk, 0);
+              const fallbackTotalSize =
+                scanSizeModeRef.current === "disk"
+                  ? derivedTotalSizeDisk
+                  : derivedTotalSizeLogical;
               setScanStats({
                 filesFound: Number(
                   payload.filesFound ?? derivedFilesFound ?? 0,
@@ -111,7 +126,22 @@ function App() {
                 directoriesFound: Number(
                   payload.directoriesFound ?? derivedDirectoriesFound ?? 0,
                 ),
-                totalSize: Number(payload.totalSize ?? derivedTotalSize ?? 0),
+                totalSizeLogical: Number(
+                  payload.totalSizeLogical ??
+                    (scanSizeModeRef.current === "logical"
+                      ? payload.totalSize
+                      : undefined) ??
+                    fallbackTotalSize ??
+                    0,
+                ),
+                totalSizeDisk: Number(
+                  payload.totalSizeDisk ??
+                    (scanSizeModeRef.current === "disk"
+                      ? payload.totalSize
+                      : undefined) ??
+                    fallbackTotalSize ??
+                    0,
+                ),
               });
               // 一次性更新所有结果
               setFiles(payload.results);
@@ -214,6 +244,9 @@ function App() {
     setScanStats(null);
     setTerminalState(null);
     setLastTimeoutSeconds(timeoutSeconds);
+    setScanRoot(path);
+    scanSizeModeRef.current = sizeMode;
+    lastScanOptionsRef.current = { limit, minSize, timeoutSeconds };
     try {
       // 使用新的带进度扫描命令
       const scanId = await invoke<string>("scan_directory_with_progress", {
@@ -286,6 +319,30 @@ function App() {
     setConfirmDelete(file);
   };
 
+  const handleShowInFinder = async (file: FileInfo) => {
+    try {
+      await invoke("show_in_finder", { path: file.path });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "无法在 Finder 中显示");
+    }
+  };
+
+  const handleCopyPath = async (file: FileInfo) => {
+    try {
+      await navigator.clipboard.writeText(file.path);
+      setSuccess("路径已复制");
+      setTimeout(() => setSuccess(null), 2000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "复制路径失败");
+    }
+  };
+
+  const handleRescanDirectory = (file: FileInfo) => {
+    if (!file.is_dir) return;
+    const { limit, minSize, timeoutSeconds } = lastScanOptionsRef.current;
+    void handleScan(file.path, limit, minSize, timeoutSeconds);
+  };
+
   const confirmDeleteAction = async () => {
     if (!confirmDelete) return;
 
@@ -298,8 +355,47 @@ function App() {
       // 3秒后自动清除成功消息
       setTimeout(() => setSuccess(null), 3000);
 
-      // 从列表中移除已删除的项目
-      setFiles(files.filter((f) => f.path !== confirmDelete.path));
+      // 从列表中移除已删除的项目；目录删除后同步移除子项。
+      const deletedPathPrefix = confirmDelete.path.endsWith("/")
+        ? confirmDelete.path
+        : `${confirmDelete.path}/`;
+      const removedItems = files.filter(
+        (f) =>
+          f.path === confirmDelete.path ||
+          (confirmDelete.is_dir && f.path.startsWith(deletedPathPrefix)),
+      );
+      setFiles((currentFiles) =>
+        currentFiles.filter(
+          (f) =>
+            f.path !== confirmDelete.path &&
+            (!confirmDelete.is_dir || !f.path.startsWith(deletedPathPrefix)),
+        ),
+      );
+      setScanStats((currentStats) => {
+        if (!currentStats) return currentStats;
+
+        return {
+          ...currentStats,
+          filesFound: Math.max(
+            0,
+            currentStats.filesFound -
+              removedItems.filter((item) => !item.is_dir).length,
+          ),
+          directoriesFound: Math.max(
+            0,
+            currentStats.directoriesFound -
+              removedItems.filter((item) => item.is_dir).length,
+          ),
+          totalSizeLogical: Math.max(
+            0,
+            currentStats.totalSizeLogical - confirmDelete.sizeLogical,
+          ),
+          totalSizeDisk: Math.max(
+            0,
+            currentStats.totalSizeDisk - confirmDelete.sizeDisk,
+          ),
+        };
+      });
       // 最后关闭确认对话框
       setConfirmDelete(null);
     } catch (err) {
@@ -323,12 +419,11 @@ function App() {
     return `${size.toFixed(2)} ${units[unitIndex]}`;
   };
 
-  const displayedSize = files.reduce(
-    (sum, file) =>
-      sum + (sizeMode === "disk" ? file.sizeDisk : file.sizeLogical),
-    0,
-  );
-  const headerTotalSize = displayedSize;
+  const headerTotalSize = scanStats
+    ? sizeMode === "disk"
+      ? scanStats.totalSizeDisk
+      : scanStats.totalSizeLogical
+    : 0;
   const totalItems =
     (scanStats?.filesFound ?? 0) + (scanStats?.directoriesFound ?? 0);
 
@@ -354,7 +449,7 @@ function App() {
             </div>
             {scanStats && (
               <div className="text-xs text-gray-400 leading-tight">
-                当前列表合计: {formatFileSize(displayedSize)}
+                统计口径: {sizeMode === "disk" ? "磁盘使用量" : "逻辑大小"}
               </div>
             )}
             {scanStats && (
@@ -413,7 +508,11 @@ function App() {
             ) : files.length > 0 ? (
               <FileList
                 files={files}
+                scanRoot={scanRoot}
                 onDelete={handleDelete}
+                onShowInFinder={handleShowInFinder}
+                onCopyPath={handleCopyPath}
+                onRescanDirectory={handleRescanDirectory}
                 formatFileSize={formatFileSize}
                 sizeMode={sizeMode}
               />

@@ -15,6 +15,7 @@ pub fn run() {
             commands::scan_directory_with_progress,
             commands::cancel_scan,
             commands::delete_path,
+            commands::show_in_finder,
         ])
         .setup(|app| {
             #[cfg(debug_assertions)]

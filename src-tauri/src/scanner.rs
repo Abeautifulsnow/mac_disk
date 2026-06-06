@@ -119,10 +119,13 @@ where
     tracing::info!("[{}] 开始流式遍历目录...", scan_id);
     let mut dir_sizes: HashMap<PathBuf, (u64, u64)> = HashMap::new();
     let mut selected_files: Vec<FileInfo> = Vec::new();
+    let mut preview_files: Vec<FileInfo> = Vec::new();
+    let mut preview_directories_sent: HashMap<String, (u64, u64)> = HashMap::new();
     let mut total_logical_size: u64 = 0;
     let mut total_disk_usage: u64 = 0;
     let use_disk_mode = size_mode == Some("disk");
     let mut matched_files_found = 0usize;
+    let preview_limit = limit.unwrap_or(50).max(1);
     let dir_calc_start = Instant::now();
     let mut discovered_entries = 0usize;
     let mut last_progress_emit = Instant::now();
@@ -179,18 +182,42 @@ where
                 if let Ok(info) =
                     create_file_info_from_metadata(entry.path(), size, false, &metadata)
                 {
+                    let preview_item = retain_top_files(
+                        &mut preview_files,
+                        info.clone(),
+                        Some(preview_limit),
+                        use_disk_mode,
+                    );
                     retain_top_files(&mut selected_files, info, limit, use_disk_mode);
+                    if let Some(file) = preview_item {
+                        progress_callback(ScanEvent::FileFound {
+                            scan_id: scan_id.clone(),
+                            file,
+                        })?;
+                    }
                 }
             }
         }
 
-        maybe_emit_progress(
+        let progress_emitted = maybe_emit_progress(
             &mut progress_callback,
             &scan_id,
             &mut last_progress_emit,
             discovered_entries,
             &current_path,
         )?;
+        if progress_emitted {
+            emit_directory_previews(
+                root,
+                &dir_sizes,
+                min_size,
+                use_disk_mode,
+                preview_limit,
+                &scan_id,
+                &mut preview_directories_sent,
+                &mut progress_callback,
+            )?;
+        }
     }
 
     metrics.dir_calc_time = dir_calc_start.elapsed().as_nanos();
@@ -203,6 +230,16 @@ where
         current_path: root.to_string_lossy().to_string(),
         phase: Some("processing".to_string()),
     })?;
+    emit_directory_previews(
+        root,
+        &dir_sizes,
+        min_size,
+        use_disk_mode,
+        preview_limit,
+        &scan_id,
+        &mut preview_directories_sent,
+        &mut progress_callback,
+    )?;
 
     // 收集符合大小要求的目录。前端现在会构建可展开树形表格，
     // 因此不能再过滤掉已选父目录下面的子项。
@@ -307,7 +344,7 @@ fn maybe_emit_progress<F>(
     last_progress_emit: &mut Instant,
     processed: usize,
     current_path: &str,
-) -> Result<(), Box<dyn std::error::Error>>
+) -> Result<bool, Box<dyn std::error::Error>>
 where
     F: FnMut(ScanEvent) -> Result<(), Box<dyn std::error::Error>>,
 {
@@ -321,9 +358,10 @@ where
             current_path: current_path.to_string(),
             phase: Some("walking".to_string()),
         })?;
+        return Ok(true);
     }
 
-    Ok(())
+    Ok(false)
 }
 
 fn accumulate_parent_sizes(
@@ -377,19 +415,19 @@ fn retain_top_files(
     candidate: FileInfo,
     limit: Option<usize>,
     use_disk_mode: bool,
-) {
+) -> Option<FileInfo> {
     let Some(limit) = limit else {
         selected_files.push(candidate);
-        return;
+        return selected_files.last().cloned();
     };
 
     if limit == 0 {
-        return;
+        return None;
     }
 
     if selected_files.len() < limit {
         selected_files.push(candidate);
-        return;
+        return selected_files.last().cloned();
     }
 
     let weakest_index = selected_files
@@ -416,8 +454,81 @@ fn retain_top_files(
             == std::cmp::Ordering::Less
         {
             selected_files[index] = candidate;
+            return Some(selected_files[index].clone());
         }
     }
+
+    None
+}
+
+fn emit_directory_previews<F>(
+    root: &Path,
+    dir_sizes: &HashMap<PathBuf, (u64, u64)>,
+    min_size: Option<u64>,
+    use_disk_mode: bool,
+    preview_limit: usize,
+    scan_id: &str,
+    preview_directories_sent: &mut HashMap<String, (u64, u64)>,
+    progress_callback: &mut F,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: FnMut(ScanEvent) -> Result<(), Box<dyn std::error::Error>>,
+{
+    let preview_dirs = collect_preview_directories(
+        root,
+        dir_sizes,
+        min_size,
+        use_disk_mode,
+        preview_limit,
+    );
+
+    for directory in preview_dirs {
+        let next_sizes = (directory.size_logical, directory.size_disk);
+        let should_emit = preview_directories_sent
+            .get(&directory.path)
+            .map(|sizes| *sizes != next_sizes)
+            .unwrap_or(true);
+        if should_emit {
+            preview_directories_sent.insert(directory.path.clone(), next_sizes);
+            progress_callback(ScanEvent::DirectoryFound {
+                scan_id: scan_id.to_string(),
+                directory,
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_preview_directories(
+    root: &Path,
+    dir_sizes: &HashMap<PathBuf, (u64, u64)>,
+    min_size: Option<u64>,
+    use_disk_mode: bool,
+    preview_limit: usize,
+) -> Vec<FileInfo> {
+    let mut preview_dirs = dir_sizes
+        .iter()
+        .filter(|(path, _)| *path != root)
+        .filter(|(_, sizes)| {
+            if let Some(min) = min_size {
+                if use_disk_mode {
+                    sizes.1 >= min
+                } else {
+                    sizes.0 >= min
+                }
+            } else {
+                true
+            }
+        })
+        .filter_map(|(path, sizes)| {
+            create_file_info_with_sizes(path, sizes.0, sizes.1, true).ok()
+        })
+        .collect::<Vec<_>>();
+
+    preview_dirs.sort_by(|a, b| compare_file_info(a, b, use_disk_mode));
+    preview_dirs.truncate(preview_limit);
+    preview_dirs
 }
 
 fn add_ancestor_dirs(
@@ -651,5 +762,50 @@ mod tests {
         assert_eq!(file_paths.len(), 2);
         assert!(file_paths.contains(&medium.to_string_lossy().to_string()));
         assert!(file_paths.contains(&large.to_string_lossy().to_string()));
+    }
+
+    #[test]
+    fn progress_scan_emits_preview_events_before_completion() {
+        let dir = TestDir::new("preview_events");
+        dir.write_file("alpha.bin", 64);
+        dir.write_file("nested/beta.bin", 96);
+
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let mut events = Vec::new();
+
+        let result = scan_directory_with_progress(
+            &dir.path,
+            Some(5),
+            None,
+            cancel_flag,
+            "test-scan".to_string(),
+            Some("logical"),
+            |event| {
+                events.push(event);
+                Ok(())
+            },
+        );
+
+        assert!(result.is_ok());
+        assert!(events.iter().any(|event| matches!(event, ScanEvent::FileFound { .. })));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ScanEvent::DirectoryFound { .. })));
+
+        let completed_index = events
+            .iter()
+            .position(|event| matches!(event, ScanEvent::Completed { .. }))
+            .expect("completed event missing");
+        let preview_index = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    ScanEvent::FileFound { .. } | ScanEvent::DirectoryFound { .. }
+                )
+            })
+            .expect("preview event missing");
+
+        assert!(preview_index < completed_index);
     }
 }

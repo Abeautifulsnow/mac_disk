@@ -42,6 +42,8 @@ Questions to answer:
 - `ScanEvent.completed.totalSizeLogical`: total logical bytes scanned for the root.
 - `ScanEvent.completed.totalSizeDisk`: total disk-usage bytes scanned for the root.
 - `ScanEvent.progress.phase`: `"walking"` during traversal and `"processing"` during final result assembly.
+- `ScanEvent.fileFound.file`: a preview item emitted during scanning; it may be replaced or omitted from the final result set after limit/truncation is applied.
+- `ScanEvent.directoryFound.directory`: a preview directory emitted during scanning; repeated events for the same path may carry updated aggregate sizes.
 
 ### 4. Validation & Error Matrix
 
@@ -52,6 +54,7 @@ Questions to answer:
 ### 5. Good/Base/Bad Cases
 
 - Good: Header shows total scanned bytes from `totalSizeLogical` / `totalSizeDisk`, and separately shows `resultCount` displayed items.
+- Good: Preview events are treated as provisional UI state, while `completed.results` remains the authoritative final result set.
 - Base: If older payloads omit totals, UI may fall back to deriving totals from `results`, but new code should prefer explicit backend fields.
 - Bad: Naming the same disk-size value `diskUsage` in docs while code uses `sizeDisk`.
 

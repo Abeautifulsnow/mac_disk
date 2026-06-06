@@ -16,7 +16,7 @@ A high-performance desktop application for macOS that helps you identify and man
 - **Recursive Directory Analysis**: Deep scan any directory to find large files and folders
 - **Real-time Progress Tracking**: Live updates with estimated time remaining (ETA)
 - **Performance Optimized**: Single-pass streaming traversal with bounded top-K retention and efficient metadata reuse
-- **Progressive Scan Status**: Progress events show discovery and processing phases; results are returned when the scan completes
+- **Progressive Scan Status**: Progress events show discovery and processing phases, and matching previews appear during the scan before final results are committed
 
 ### ⚡ **Smart Filtering**
 - **Size Threshold**: Set minimum file size to filter out small items

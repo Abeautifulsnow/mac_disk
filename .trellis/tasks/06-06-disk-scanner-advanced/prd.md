@@ -29,7 +29,7 @@ Upgrade the macOS disk scanner from a working large-file browser into a more rel
 * Keep logical size and disk usage behavior consistent across sorting, filtering, totals, details, and delete confirmation.
 * Add focused Rust tests for scanner aggregation, size mode filtering/sorting, ancestor inclusion, and sensitive path checks where feasible.
 * Reduce scanner memory pressure by removing the full `Vec<DirEntry>` buffering step.
-* Preserve current progress semantics while making traversal incremental.
+* Preserve current progress semantics while making traversal incremental, and expose provisional preview results during scanning.
 * Add focused frontend tests or extract testable pure helpers for tree building/stat calculation if the existing tooling can support it without large dependency churn.
 * Align README/OpenSpec notes with the actual implemented field names and behavior.
 * Preserve existing app flows: scan, cancel, timeout, show in Finder, copy path, rescan directory, and move to trash.
@@ -71,7 +71,8 @@ Implemented approach:
 4. Add focused backend tests using temporary directories under the test runtime.
 5. Replace full-entry buffering with streaming traversal and top-K file retention under `limit`.
 6. Keep progress events compatible by reporting `"walking"` during traversal and `"processing"` during final result assembly.
-7. Update README/OpenSpec docs to match actual behavior.
+7. Restore `fileFound` / `directoryFound` as provisional preview events during scanning.
+8. Update README/OpenSpec docs to match actual behavior.
 
 ## Decision (ADR-lite)
 
@@ -79,7 +80,7 @@ Implemented approach:
 
 **Decision**: Complete the contract/statistics/testing/documentation slice first, then extend the same task with a narrowly scoped scanner-core refactor for streaming traversal and bounded top-K retention.
 
-**Consequences**: This keeps the product-facing surface stable while eliminating the largest memory-pressure issue in the scanner. It still does not implement incremental result streaming to the UI or richer analytics views.
+**Consequences**: This keeps the product-facing surface stable while eliminating the largest memory-pressure issue in the scanner. The UI now receives provisional preview items during scanning, but richer analytics views and fully virtualized incremental result management are still out of scope.
 
 ## Open Questions
 

@@ -13,6 +13,17 @@ import FileList from "./components/FileList";
 import Scanner from "./components/Scanner";
 import type { FileInfo, ScanEvent, ScanProgress } from "./types";
 
+function sortBySize(
+  items: FileInfo[],
+  mode: "logical" | "disk",
+): FileInfo[] {
+  return [...items].sort((a, b) => {
+    const aSize = mode === "disk" ? a.sizeDisk : a.sizeLogical;
+    const bSize = mode === "disk" ? b.sizeDisk : b.sizeLogical;
+    return bSize - aSize || a.path.localeCompare(b.path);
+  });
+}
+
 function App() {
   const [files, setFiles] = useState<FileInfo[]>([]);
   const [loading, setLoading] = useState(false);
@@ -87,11 +98,29 @@ function App() {
               break;
 
             case "fileFound":
-              // 实时文件事件已禁用，改为在完成时一次性更新
+              setFiles((currentFiles) => {
+                const next = new Map(
+                  currentFiles.map((item) => [item.path, item] as const),
+                );
+                next.set(payload.file.path, payload.file);
+                return sortBySize(
+                  Array.from(next.values()),
+                  scanSizeModeRef.current,
+                );
+              });
               break;
 
             case "directoryFound":
-              // 实时目录事件已禁用，改为在完成时一次性更新
+              setFiles((currentFiles) => {
+                const next = new Map(
+                  currentFiles.map((item) => [item.path, item] as const),
+                );
+                next.set(payload.directory.path, payload.directory);
+                return sortBySize(
+                  Array.from(next.values()),
+                  scanSizeModeRef.current,
+                );
+              });
               break;
 
             case "completed":
@@ -503,7 +532,7 @@ function App() {
               </div>
             )}
 
-            {loading ? (
+            {loading && files.length === 0 ? (
               <div className="flex flex-col items-center justify-center py-12">
                 <Loader2 className="h-12 w-12 text-blue-600 animate-spin mb-4" />
                 <p className="text-gray-600">正在扫描磁盘，请稍候...</p>

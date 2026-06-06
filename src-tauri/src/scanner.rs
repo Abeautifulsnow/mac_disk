@@ -414,6 +414,7 @@ where
         scan_id: scan_id.clone(),
         files_found: total_files_found,
         directories_found: total_directories_found,
+        result_count: results.len(),
         total_size,
         total_size_logical: total_logical_size,
         total_size_disk: total_disk_usage,
@@ -519,5 +520,128 @@ fn create_file_info_with_sizes(
                 .unwrap_or_default(),
             size_disk,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(name: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "mac_disk_scanner_{}_{}_{}",
+                name,
+                std::process::id(),
+                unique
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn write_file(&self, relative_path: &str, size: usize) -> PathBuf {
+            let path = self.path.join(relative_path);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(&path, vec![b'x'; size]).unwrap();
+            path
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn find_item<'a>(items: &'a [FileInfo], path: &Path) -> &'a FileInfo {
+        let path = path.to_string_lossy();
+        items
+            .iter()
+            .find(|item| item.path == path)
+            .unwrap_or_else(|| panic!("missing item: {}", path))
+    }
+
+    #[test]
+    fn scan_returns_files_directories_and_total_logical_size() {
+        let dir = TestDir::new("totals");
+        let file_a = dir.write_file("alpha.bin", 12);
+        let nested_file = dir.write_file("nested/beta.bin", 30);
+        let nested_dir = dir.path.join("nested");
+
+        let results = scan_directory(&dir.path, None, None, Some("logical")).unwrap();
+
+        let alpha = find_item(&results, &file_a);
+        assert!(!alpha.is_dir);
+        assert_eq!(alpha.size_logical, 12);
+        assert!(alpha.size_disk >= alpha.size_logical);
+
+        let beta = find_item(&results, &nested_file);
+        assert!(!beta.is_dir);
+        assert_eq!(beta.size_logical, 30);
+
+        let nested = find_item(&results, &nested_dir);
+        assert!(nested.is_dir);
+        assert_eq!(nested.size_logical, 30);
+        assert!(nested.size_disk >= nested.size_logical);
+    }
+
+    #[test]
+    fn min_size_filter_uses_selected_size_mode_for_files_and_dirs() {
+        let dir = TestDir::new("min_size");
+        let small_file = dir.write_file("small.bin", 8);
+        let large_file = dir.write_file("folder/large.bin", 64);
+        let folder = dir.path.join("folder");
+
+        let results = scan_directory(&dir.path, None, Some(32), Some("logical")).unwrap();
+
+        assert!(results
+            .iter()
+            .all(|item| item.path != small_file.to_string_lossy()));
+        assert!(results
+            .iter()
+            .any(|item| item.path == large_file.to_string_lossy()));
+        assert!(results
+            .iter()
+            .any(|item| item.path == folder.to_string_lossy()));
+    }
+
+    #[test]
+    fn limited_results_include_ancestors_for_tree_rendering() {
+        let dir = TestDir::new("ancestors");
+        let large_file = dir.write_file("a/b/c/large.bin", 128);
+        let small_file = dir.write_file("z/small.bin", 1);
+        let ancestor_a = dir.path.join("a");
+        let ancestor_b = dir.path.join("a/b");
+        let ancestor_c = dir.path.join("a/b/c");
+
+        let results = scan_directory(&dir.path, Some(1), Some(2), Some("logical")).unwrap();
+
+        assert!(results
+            .iter()
+            .any(|item| item.path == large_file.to_string_lossy()));
+        assert!(!results
+            .iter()
+            .any(|item| item.path == small_file.to_string_lossy()));
+        assert!(results
+            .iter()
+            .any(|item| item.path == ancestor_a.to_string_lossy()));
+        assert!(results
+            .iter()
+            .any(|item| item.path == ancestor_b.to_string_lossy()));
+        assert!(results
+            .iter()
+            .any(|item| item.path == ancestor_c.to_string_lossy()));
     }
 }

@@ -32,6 +32,7 @@ export type ScanEvent =
       scanId: string;
       filesFound: number;
       directoriesFound: number;
+      resultCount: number;
       totalSize: number;
       totalSizeLogical?: number;
       totalSizeDisk?: number;

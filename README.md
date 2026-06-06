@@ -16,7 +16,7 @@ A high-performance desktop application for macOS that helps you identify and man
 - **Recursive Directory Analysis**: Deep scan any directory to find large files and folders
 - **Real-time Progress Tracking**: Live updates with estimated time remaining (ETA)
 - **Performance Optimized**: Parallel processing with Rayon, efficient metadata caching
-- **Progressive Results**: Files are displayed as they're discovered
+- **Progressive Scan Status**: Progress events show discovery and processing phases; results are returned when the scan completes
 
 ### ⚡ **Smart Filtering**
 - **Size Threshold**: Set minimum file size to filter out small items
@@ -35,7 +35,17 @@ A high-performance desktop application for macOS that helps you identify and man
 - **Fixed-Height Lists**: Scrollable result tables with sticky headers
 - **Type Information**: File types and modified dates displayed
 - **Action Controls**: Quick delete buttons with visual feedback
-- **Real-time Stats**: Show files found, directories found, and total size
+- **Clear Scan Stats**: Separates total scanned size, matched item counts, and displayed result count
+
+## 📐 Data Contract
+
+The scan result contract uses explicit size fields across Rust and TypeScript:
+
+- `sizeLogical`: logical file content size from `metadata.len()`
+- `sizeDisk`: disk usage from `metadata.blocks() * 512`, falling back to logical size when block data is unavailable
+- `totalSizeLogical` / `totalSizeDisk`: total bytes scanned for the requested root
+- `filesFound` / `directoriesFound`: matched items before display truncation
+- `resultCount`: number of items returned to the frontend for display
 
 ## 🛠️ Technology Stack
 

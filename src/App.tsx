@@ -25,6 +25,7 @@ function App() {
   const [scanStats, setScanStats] = useState<{
     filesFound: number;
     directoriesFound: number;
+    resultCount: number;
     totalSizeLogical: number;
     totalSizeDisk: number;
   } | null>(null);
@@ -125,6 +126,9 @@ function App() {
                 ),
                 directoriesFound: Number(
                   payload.directoriesFound ?? derivedDirectoriesFound ?? 0,
+                ),
+                resultCount: Number(
+                  payload.resultCount ?? resultsForStats.length ?? 0,
                 ),
                 totalSizeLogical: Number(
                   payload.totalSizeLogical ??
@@ -386,6 +390,7 @@ function App() {
             currentStats.directoriesFound -
               removedItems.filter((item) => item.is_dir).length,
           ),
+          resultCount: Math.max(0, currentStats.resultCount - removedItems.length),
           totalSizeLogical: Math.max(
             0,
             currentStats.totalSizeLogical - confirmDelete.sizeLogical,
@@ -442,7 +447,7 @@ function App() {
           </div>
           <div className="flex flex-col items-end gap-1 text-right max-w-[260px]">
             <div className="text-sm text-gray-500 leading-tight">
-              总扫描大小:{" "}
+              已扫描总大小:{" "}
               <span className="font-semibold">
                 {formatFileSize(headerTotalSize)}
               </span>
@@ -455,11 +460,12 @@ function App() {
             {scanStats && (
               <>
                 <div className="text-xs text-gray-400 leading-tight">
-                  文件: {scanStats.filesFound.toLocaleString()} | 目录:{" "}
+                  符合条件: 文件 {scanStats.filesFound.toLocaleString()} | 目录{" "}
                   {scanStats.directoriesFound.toLocaleString()}
                 </div>
                 <div className="text-xs text-gray-400 leading-tight">
-                  总计: {totalItems.toLocaleString()} 个项目
+                  当前展示: {scanStats.resultCount.toLocaleString()} /{" "}
+                  {totalItems.toLocaleString()} 个项目
                 </div>
               </>
             )}

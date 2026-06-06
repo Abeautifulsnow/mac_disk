@@ -67,6 +67,8 @@ pub enum ScanEvent {
         files_found: usize,
         #[serde(rename = "directoriesFound")]
         directories_found: usize,
+        #[serde(rename = "resultCount")]
+        result_count: usize,
         #[serde(rename = "totalSize")]
         total_size: u64,
         #[serde(rename = "totalSizeLogical")]

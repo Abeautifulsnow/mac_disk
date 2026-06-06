@@ -47,8 +47,12 @@ function App() {
 
   // 使用 ref 来跟踪最新的 currentScanId，避免闭包问题
   const currentScanIdRef = useRef<string | null>(null);
+  const loadingRef = useRef(false);
   const terminalStateRef = useRef<"timeout" | null>(null);
   const scanSizeModeRef = useRef<"logical" | "disk">("logical");
+  const previewQueueRef = useRef<Map<string, FileInfo>>(new Map());
+  const previewFlushTimerRef = useRef<number | null>(null);
+  const previewSessionRef = useRef(0);
   const lastScanOptionsRef = useRef({
     limit: 50,
     minSize: 10,
@@ -62,6 +66,51 @@ function App() {
   useEffect(() => {
     terminalStateRef.current = terminalState;
   }, [terminalState]);
+  useEffect(() => {
+    loadingRef.current = loading;
+  }, [loading]);
+
+  useEffect(() => {
+    return () => {
+      if (previewFlushTimerRef.current !== null) {
+        window.clearTimeout(previewFlushTimerRef.current);
+        previewFlushTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  const clearPreviewQueue = () => {
+    previewSessionRef.current += 1;
+    previewQueueRef.current.clear();
+    if (previewFlushTimerRef.current !== null) {
+      window.clearTimeout(previewFlushTimerRef.current);
+      previewFlushTimerRef.current = null;
+    }
+  };
+
+  const schedulePreviewFlush = () => {
+    if (previewFlushTimerRef.current !== null) return;
+
+    const sessionAtSchedule = previewSessionRef.current;
+    previewFlushTimerRef.current = window.setTimeout(() => {
+      previewFlushTimerRef.current = null;
+
+      if (sessionAtSchedule !== previewSessionRef.current) return;
+      if (!loadingRef.current) return;
+
+      const previewItems = Array.from(previewQueueRef.current.values());
+      setFiles(sortBySize(previewItems, scanSizeModeRef.current));
+    }, 120);
+  };
+
+  const isEventForActiveScan = (scanId: string) => {
+    const activeScanId = currentScanIdRef.current;
+    if (activeScanId) {
+      return scanId === activeScanId;
+    }
+
+    return loadingRef.current;
+  };
 
   // 监听扫描事件 - 使用 useRef 来获取最新的 currentScanId
   useEffect(() => {
@@ -72,6 +121,10 @@ function App() {
         unlisten = await listen<ScanEvent>("scan-event", (event) => {
           const payload = event.payload;
           console.log("收到扫描事件:", payload.type, "scanId:", payload.scanId);
+
+          if (!isEventForActiveScan(payload.scanId)) {
+            return;
+          }
 
           switch (payload.type) {
             case "progress":
@@ -98,29 +151,13 @@ function App() {
               break;
 
             case "fileFound":
-              setFiles((currentFiles) => {
-                const next = new Map(
-                  currentFiles.map((item) => [item.path, item] as const),
-                );
-                next.set(payload.file.path, payload.file);
-                return sortBySize(
-                  Array.from(next.values()),
-                  scanSizeModeRef.current,
-                );
-              });
+              previewQueueRef.current.set(payload.file.path, payload.file);
+              schedulePreviewFlush();
               break;
 
             case "directoryFound":
-              setFiles((currentFiles) => {
-                const next = new Map(
-                  currentFiles.map((item) => [item.path, item] as const),
-                );
-                next.set(payload.directory.path, payload.directory);
-                return sortBySize(
-                  Array.from(next.values()),
-                  scanSizeModeRef.current,
-                );
-              });
+              previewQueueRef.current.set(payload.directory.path, payload.directory);
+              schedulePreviewFlush();
               break;
 
             case "completed":
@@ -149,6 +186,7 @@ function App() {
                 scanSizeModeRef.current === "disk"
                   ? derivedTotalSizeDisk
                   : derivedTotalSizeLogical;
+              clearPreviewQueue();
               setScanStats({
                 filesFound: Number(
                   payload.filesFound ?? derivedFilesFound ?? 0,
@@ -181,6 +219,7 @@ function App() {
               setLoading(false);
               setCancelPending(false);
               setCurrentScanId(null);
+              currentScanIdRef.current = null;
               setScanProgress(null);
               setTerminalState(null);
               break;
@@ -202,8 +241,10 @@ function App() {
                 setLoading(false);
                 setCancelPending(false);
                 setCurrentScanId(null);
+                currentScanIdRef.current = null;
                 setScanProgress(null);
                 setScanStats(null);
+                clearPreviewQueue();
                 setFiles([]);
               }
               break;
@@ -223,9 +264,11 @@ function App() {
                 setLoading(false);
                 setCancelPending(false);
                 setCurrentScanId(null);
+                currentScanIdRef.current = null;
                 setScanProgress(null);
                 setTerminalState("timeout");
                 setScanStats(null);
+                clearPreviewQueue();
                 setFiles([]);
               }
               break;
@@ -241,9 +284,11 @@ function App() {
               setLoading(false);
               setCancelPending(false);
               setCurrentScanId(null);
+              currentScanIdRef.current = null;
               setScanProgress(null);
               setTerminalState(null);
               setScanStats(null);
+              clearPreviewQueue();
               setFiles([]);
               break;
           }
@@ -280,6 +325,7 @@ function App() {
     setScanRoot(path);
     scanSizeModeRef.current = sizeMode;
     lastScanOptionsRef.current = { limit, minSize, timeoutSeconds };
+    clearPreviewQueue();
     try {
       // 使用新的带进度扫描命令
       const scanId = await invoke<string>("scan_directory_with_progress", {
@@ -293,11 +339,13 @@ function App() {
       });
       console.log("扫描已启动，scanId:", scanId);
       setCurrentScanId(scanId);
+      currentScanIdRef.current = scanId;
     } catch (err) {
       setError(err instanceof Error ? err.message : "启动扫描失败");
       console.error("扫描错误:", err);
       setLoading(false);
       setCancelPending(false);
+      clearPreviewQueue();
     }
   };
 
@@ -328,6 +376,8 @@ function App() {
             setScanProgress(null);
             setLoading(false);
             setCancelPending(false);
+            clearPreviewQueue();
+            currentScanIdRef.current = null;
           }, 5000);
         } else {
           setError("扫描已结束或无法取消");
@@ -343,7 +393,9 @@ function App() {
         setLoading(false);
         setCancelPending(false);
         setCurrentScanId(null);
+        currentScanIdRef.current = null;
         setScanProgress(null);
+        clearPreviewQueue();
       }
     }
   };

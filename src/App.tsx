@@ -7,7 +7,7 @@ import {
   Loader2,
   XCircle,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { startTransition, useEffect, useRef, useState } from "react";
 import ConfirmDialog from "./components/ConfirmDialog";
 import FileList from "./components/FileList";
 import Scanner from "./components/Scanner";
@@ -44,6 +44,7 @@ function App() {
   const [lastTimeoutSeconds, setLastTimeoutSeconds] = useState<number>(300);
   const [sizeMode, setSizeMode] = useState<"logical" | "disk">("logical");
   const [scanRoot, setScanRoot] = useState("/Users");
+  const [listSessionKey, setListSessionKey] = useState(0);
 
   // 使用 ref 来跟踪最新的 currentScanId，避免闭包问题
   const currentScanIdRef = useRef<string | null>(null);
@@ -99,7 +100,9 @@ function App() {
       if (!loadingRef.current) return;
 
       const previewItems = Array.from(previewQueueRef.current.values());
-      setFiles(sortBySize(previewItems, scanSizeModeRef.current));
+      startTransition(() => {
+        setFiles(sortBySize(previewItems, scanSizeModeRef.current));
+      });
     }, 120);
   };
 
@@ -323,6 +326,7 @@ function App() {
     setTerminalState(null);
     setLastTimeoutSeconds(timeoutSeconds);
     setScanRoot(path);
+    setListSessionKey((current) => current + 1);
     scanSizeModeRef.current = sizeMode;
     lastScanOptionsRef.current = { limit, minSize, timeoutSeconds };
     clearPreviewQueue();
@@ -608,6 +612,7 @@ function App() {
             ) : files.length > 0 ? (
               <FileList
                 files={files}
+                sessionKey={listSessionKey}
                 scanRoot={scanRoot}
                 isPreview={isPreviewResults}
                 onDelete={handleDelete}

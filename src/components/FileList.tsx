@@ -16,6 +16,7 @@ import type { FileInfo } from "../types";
 
 interface FileListProps {
   files: FileInfo[];
+  sessionKey: number;
   scanRoot: string;
   isPreview: boolean;
   onDelete: (file: FileInfo) => void;
@@ -79,18 +80,15 @@ function buildTree(
 ): TreeResult {
   const normalizedRoot = normalizePath(scanRoot);
   const nodeMap = new Map<string, TreeNode>();
+  const roots: TreeNode[] = [];
 
   for (const file of files) {
     const path = normalizePath(file.path);
-    nodeMap.set(path, {
+    const node: TreeNode = {
       item: { ...file, path },
       children: [],
-    });
-  }
-
-  const roots: TreeNode[] = [];
-
-  for (const node of nodeMap.values()) {
+    };
+    nodeMap.set(path, node);
     const parentPath = getParentPath(node.item.path);
     const parentNode =
       parentPath && parentPath !== normalizedRoot
@@ -171,6 +169,7 @@ function buildPathSegments(scanRoot: string, currentPath: string) {
 
 export default function FileList({
   files,
+  sessionKey,
   scanRoot,
   isPreview,
   onDelete,
@@ -194,8 +193,9 @@ export default function FileList({
   useEffect(() => {
     setExpandedPaths(new Set());
     setViewPath(normalizedRoot);
+    setSelectedPath(null);
     setOpenMenuPath(null);
-  }, [normalizedRoot, files]);
+  }, [normalizedRoot, sessionKey]);
 
   useEffect(() => {
     setSelectedPath((current) => {

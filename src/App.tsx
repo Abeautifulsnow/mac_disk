@@ -460,6 +460,8 @@ function App() {
     : 0;
   const totalItems =
     (scanStats?.filesFound ?? 0) + (scanStats?.directoriesFound ?? 0);
+  const isPreviewResults = loading && files.length > 0;
+  const previewItemCount = files.length;
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -475,19 +477,17 @@ function App() {
             </div>
           </div>
           <div className="flex flex-col items-end gap-1 text-right max-w-[260px]">
-            <div className="text-sm text-gray-500 leading-tight">
-              已扫描总大小:{" "}
-              <span className="font-semibold">
-                {formatFileSize(headerTotalSize)}
-              </span>
-            </div>
-            {scanStats && (
-              <div className="text-xs text-gray-400 leading-tight">
-                统计口径: {sizeMode === "disk" ? "磁盘使用量" : "逻辑大小"}
-              </div>
-            )}
-            {scanStats && (
+            {scanStats ? (
               <>
+                <div className="text-sm text-gray-500 leading-tight">
+                  已扫描总大小:{" "}
+                  <span className="font-semibold">
+                    {formatFileSize(headerTotalSize)}
+                  </span>
+                </div>
+                <div className="text-xs text-gray-400 leading-tight">
+                  统计口径: {sizeMode === "disk" ? "磁盘使用量" : "逻辑大小"}
+                </div>
                 <div className="text-xs text-gray-400 leading-tight">
                   符合条件: 文件 {scanStats.filesFound.toLocaleString()} | 目录{" "}
                   {scanStats.directoriesFound.toLocaleString()}
@@ -497,6 +497,19 @@ function App() {
                   {totalItems.toLocaleString()} 个项目
                 </div>
               </>
+            ) : isPreviewResults ? (
+              <>
+                <div className="text-sm text-amber-700 leading-tight font-medium">
+                  扫描中预览: {previewItemCount.toLocaleString()} 个项目
+                </div>
+                <div className="text-xs text-amber-600 leading-tight">
+                  列表仍在变化，完成后会切换为最终结果
+                </div>
+              </>
+            ) : (
+              <div className="text-xs text-gray-400 leading-tight">
+                等待扫描
+              </div>
             )}
           </div>
         </div>
@@ -544,6 +557,7 @@ function App() {
               <FileList
                 files={files}
                 scanRoot={scanRoot}
+                isPreview={isPreviewResults}
                 onDelete={handleDelete}
                 onShowInFinder={handleShowInFinder}
                 onCopyPath={handleCopyPath}

@@ -17,6 +17,7 @@ import type { FileInfo } from "../types";
 interface FileListProps {
   files: FileInfo[];
   scanRoot: string;
+  isPreview: boolean;
   onDelete: (file: FileInfo) => void;
   onShowInFinder: (file: FileInfo) => void;
   onCopyPath: (file: FileInfo) => void;
@@ -171,6 +172,7 @@ function buildPathSegments(scanRoot: string, currentPath: string) {
 export default function FileList({
   files,
   scanRoot,
+  isPreview,
   onDelete,
   onShowInFinder,
   onCopyPath,
@@ -264,7 +266,7 @@ export default function FileList({
         <div className="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">
           <div>
             <h2 className="text-lg font-semibold text-gray-900">
-              扫描结果 ({files.length} 项)
+              {isPreview ? "扫描中预览" : "扫描结果"} ({files.length} 项)
             </h2>
             <div className="mt-2 flex flex-wrap items-center gap-2 text-sm text-gray-500">
               {pathSegments.map((segment, index) => (
@@ -287,12 +289,17 @@ export default function FileList({
           </div>
 
           <div className="text-right text-sm text-gray-500">
-            <div>树形表格支持逐层展开和查看详情</div>
+            <div>{isPreview ? "预览结果会持续变化" : "树形表格支持逐层展开和查看详情"}</div>
             <div className="mt-1 text-xs text-gray-400">
               当前层级: {currentLevelLabel}
             </div>
           </div>
         </div>
+        {isPreview && (
+          <div className="mt-3 border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+            当前列表是扫描中的预览结果。大小、目录层级和展示项会继续变化，最终结果将在扫描完成后替换此视图。
+          </div>
+        )}
       </div>
 
       <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_320px]">
@@ -494,10 +501,11 @@ export default function FileList({
                                   onClick={() =>
                                     handleMenuAction(() => onRescanDirectory(item))
                                   }
-                                  className="flex w-full items-center gap-2 px-3 py-2 text-left text-gray-700 hover:bg-gray-50"
+                                  disabled={isPreview}
+                                  className="flex w-full items-center gap-2 px-3 py-2 text-left text-gray-700 hover:bg-gray-50 disabled:cursor-not-allowed disabled:text-gray-400"
                                 >
                                   <RotateCw className="h-4 w-4 text-gray-500" />
-                                  重新扫描此目录
+                                  {isPreview ? "扫描中暂不可重扫" : "重新扫描此目录"}
                                 </button>
                               )}
 
@@ -506,10 +514,11 @@ export default function FileList({
                               <button
                                 type="button"
                                 onClick={() => handleMenuAction(() => onDelete(item))}
-                                className="flex w-full items-center gap-2 px-3 py-2 text-left text-red-600 hover:bg-red-50"
+                                disabled={isPreview}
+                                className="flex w-full items-center gap-2 px-3 py-2 text-left text-red-600 hover:bg-red-50 disabled:cursor-not-allowed disabled:text-gray-400 disabled:hover:bg-white"
                               >
                                 <Trash2 className="h-4 w-4" />
-                                移到废纸篓
+                                {isPreview ? "扫描中暂不可删除" : "移到废纸篓"}
                               </button>
                             </div>
                           )}
@@ -537,7 +546,11 @@ export default function FileList({
         <aside className="bg-gray-50/70">
           <div className="border-b border-gray-200 px-6 py-4">
             <h3 className="text-sm font-semibold text-gray-900">详情</h3>
-            <p className="mt-1 text-xs text-gray-500">选中一项后查看路径、大小和更新时间</p>
+            <p className="mt-1 text-xs text-gray-500">
+              {isPreview
+                ? "预览态下大小和目录结构仍可能变化"
+                : "选中一项后查看路径、大小和更新时间"}
+            </p>
           </div>
 
           <div className="space-y-5 px-6 py-5">

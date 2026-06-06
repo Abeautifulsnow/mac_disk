@@ -41,6 +41,7 @@ Questions to answer:
 - `ScanEvent.completed.resultCount`: number of `results` items returned to the frontend for display.
 - `ScanEvent.completed.totalSizeLogical`: total logical bytes scanned for the root.
 - `ScanEvent.completed.totalSizeDisk`: total disk-usage bytes scanned for the root.
+- `ScanEvent.progress.phase`: `"walking"` during traversal and `"processing"` during final result assembly.
 
 ### 4. Validation & Error Matrix
 

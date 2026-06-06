@@ -2,13 +2,13 @@
 
 ## Goal
 
-Upgrade the macOS disk scanner from a working large-file browser into a more reliable foundation for advanced disk analysis. This task starts with the recommended first stage: stabilize the cross-layer data contract, clarify scan statistics semantics, add focused tests, and align documentation/spec notes with the actual implementation. This reduces risk before larger engine changes such as true streaming scan results and top-K memory optimization.
+Upgrade the macOS disk scanner from a working large-file browser into a more reliable foundation for advanced disk analysis. The task started with contract/statistics stabilization and then extended into a focused scanner-core refactor: replace full-entry buffering with streaming traversal and bounded top-K file retention, while preserving the cross-layer event contract.
 
 ## What I Already Know
 
 * The user asked to review the proposed advanced plan and implement it if sound.
 * The existing app is a Tauri 2 + Rust backend with React 18 + TypeScript + Vite frontend.
-* Backend scanning lives in `src-tauri/src/scanner.rs` and uses `WalkDir` to collect entries, then Rayon chunk processing to compute file and directory sizes.
+* Backend scanning lives in `src-tauri/src/scanner.rs` and now uses `WalkDir` for streaming traversal, incremental directory aggregation, and bounded file retention for top-K results.
 * Tauri command and event contracts live in `src-tauri/src/commands.rs`.
 * Frontend event handling and aggregate scan state live in `src/App.tsx`.
 * Scan controls live in `src/components/Scanner.tsx`.
@@ -19,7 +19,6 @@ Upgrade the macOS disk scanner from a working large-file browser into a more rel
 
 ## Assumptions
 
-* The first implementation slice should be conservative and test-heavy rather than immediately rewriting the scanner into a streaming engine.
 * Existing user-facing behavior should remain compatible unless a change clarifies incorrect or misleading semantics.
 * The current field names `sizeLogical` and `sizeDisk` are acceptable if documented consistently across backend, frontend, and OpenSpec.
 
@@ -27,9 +26,10 @@ Upgrade the macOS disk scanner from a working large-file browser into a more rel
 
 * Define and document the scan result data contract across Rust events and TypeScript types.
 * Clarify scan statistic semantics so the UI distinguishes scan totals from returned/displayed result totals.
-* Implement the first-stage foundation slice only; defer the streaming scan engine rewrite.
 * Keep logical size and disk usage behavior consistent across sorting, filtering, totals, details, and delete confirmation.
 * Add focused Rust tests for scanner aggregation, size mode filtering/sorting, ancestor inclusion, and sensitive path checks where feasible.
+* Reduce scanner memory pressure by removing the full `Vec<DirEntry>` buffering step.
+* Preserve current progress semantics while making traversal incremental.
 * Add focused frontend tests or extract testable pure helpers for tree building/stat calculation if the existing tooling can support it without large dependency churn.
 * Align README/OpenSpec notes with the actual implemented field names and behavior.
 * Preserve existing app flows: scan, cancel, timeout, show in Finder, copy path, rescan directory, and move to trash.
@@ -41,6 +41,7 @@ Upgrade the macOS disk scanner from a working large-file browser into a more rel
 * [x] `src/types.ts` matches the serialized Rust contract.
 * [x] Documentation no longer refers to stale `diskUsage` contract names when the actual app uses `sizeDisk`.
 * [x] `cargo test` passes for scanner/command unit tests.
+* [x] Scan execution no longer depends on buffering the full `WalkDir` entry list before processing files.
 * [x] `pnpm build` passes.
 * [x] Existing delete protection behavior remains intact.
 
@@ -54,7 +55,6 @@ Upgrade the macOS disk scanner from a working large-file browser into a more rel
 
 ## Out of Scope
 
-* Full streaming scan engine rewrite.
 * Persistent scan history.
 * File type/category analytics dashboard.
 * Cleanup recommendations for caches/build artifacts.
@@ -63,22 +63,23 @@ Upgrade the macOS disk scanner from a working large-file browser into a more rel
 
 ## Technical Approach
 
-First-stage implementation:
+Implemented approach:
 
 1. Audit current backend-to-frontend event/data flow.
 2. Add or refine contract structures so `totalSizeLogical` / `totalSizeDisk` mean total scanned bytes, while displayed result length remains separate.
 3. Update UI copy and state names where misleading.
 4. Add focused backend tests using temporary directories under the test runtime.
-5. Extract small frontend pure helpers only if needed to test stat/tree behavior without introducing a large test stack.
-6. Update README/OpenSpec docs to match actual behavior.
+5. Replace full-entry buffering with streaming traversal and top-K file retention under `limit`.
+6. Keep progress events compatible by reporting `"walking"` during traversal and `"processing"` during final result assembly.
+7. Update README/OpenSpec docs to match actual behavior.
 
 ## Decision (ADR-lite)
 
 **Context**: The earlier advanced plan includes engine, product, safety, and engineering improvements. Implementing everything in one pass would mix correctness fixes, architecture changes, and product expansion.
 
-**Decision**: Start with the contract/statistics/testing/documentation slice. Defer streaming scan and product analytics to follow-up tasks.
+**Decision**: Complete the contract/statistics/testing/documentation slice first, then extend the same task with a narrowly scoped scanner-core refactor for streaming traversal and bounded top-K retention.
 
-**Consequences**: This yields a smaller, lower-risk implementation that makes later performance work safer. It does not immediately solve memory pressure from collecting all `WalkDir` entries before processing.
+**Consequences**: This keeps the product-facing surface stable while eliminating the largest memory-pressure issue in the scanner. It still does not implement incremental result streaming to the UI or richer analytics views.
 
 ## Open Questions
 

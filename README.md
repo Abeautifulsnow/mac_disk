@@ -15,7 +15,7 @@ A high-performance desktop application for macOS that helps you identify and man
 ### 🔍 **Intelligent Disk Scanning**
 - **Recursive Directory Analysis**: Deep scan any directory to find large files and folders
 - **Real-time Progress Tracking**: Live updates with estimated time remaining (ETA)
-- **Performance Optimized**: Parallel processing with Rayon, efficient metadata caching
+- **Performance Optimized**: Single-pass streaming traversal with bounded top-K retention and efficient metadata reuse
 - **Progressive Scan Status**: Progress events show discovery and processing phases; results are returned when the scan completes
 
 ### ⚡ **Smart Filtering**
@@ -59,7 +59,6 @@ The scan result contract uses explicit size fields across Rust and TypeScript:
 - **Rust** for native performance
 - **Tauri 2.0** for desktop framework
 - **Walkdir** for directory traversal
-- **Rayon** for parallel processing
 - **Lru** for caching
 - **Tokio** for async operations
 
@@ -72,13 +71,12 @@ The scan result contract uses explicit size fields across Rust and TypeScript:
 
 The scanner includes sophisticated performance optimizations:
 
-1. **Parallel Processing**: Uses Rayon for concurrent directory traversal
-2. **Efficient Metadata Reading**: Single metadata read per file, avoiding duplicate calls
-3. **Thread-safe Caching**: Hash map for directory size accumulation
-4. **Depth Limiting**: Prevents excessive recursion (max_depth: 100)
-5. **Batch Updates**: Optimize parent directory size calculations
-6. **Progress Logging**: Debug logs every 1000 processed items
-7. **Performance Metrics**: Detailed timing for metadata reads, sorting, and calculations
+1. **Streaming Traversal**: Processes each `WalkDir` entry once instead of buffering the full tree before sizing
+2. **Bounded File Retention**: When `limit` is set, only the current top-K matching files are retained in memory
+3. **Efficient Metadata Reading**: Single metadata read per file, avoiding duplicate calls
+4. **Incremental Directory Aggregation**: Parent directory sizes are accumulated during traversal
+5. **Progress Logging**: Debug logs and progress events track traversal and final result assembly
+6. **Performance Metrics**: Detailed timing for metadata reads, aggregation, and sorting
 
 ## 🚀 Development
 

@@ -1,5 +1,4 @@
 use crate::commands::{FileInfo, ScanEvent};
-use rayon::prelude::*;
 use std::collections::HashMap;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -117,195 +116,93 @@ where
         return Err("扫描被取消".into());
     }
 
-    tracing::info!("[{}] 正在收集文件列表...", scan_id);
-    let mut entries: Vec<walkdir::DirEntry> = Vec::new();
-    let mut last_progress_emit = Instant::now();
-    for (i, entry) in WalkDir::new(root)
-        .follow_links(false)
-        .min_depth(1)
-        .into_iter()
-        .enumerate()
-    {
-        if cancel_flag.load(Ordering::SeqCst) {
-            progress_callback(ScanEvent::Cancelled {
-                scan_id: scan_id.clone(),
-            })?;
-            return Err("扫描被取消".into());
-        }
-        let Ok(entry) = entry else { continue };
-        entries.push(entry);
-        if i % 500 == 0 || last_progress_emit.elapsed().as_millis() >= 300 {
-            last_progress_emit = Instant::now();
-            let current_path = entries
-                .last()
-                .map(|e| e.path().to_string_lossy().to_string())
-                .unwrap_or_else(|| root.to_string_lossy().to_string());
-            let _ = progress_callback(ScanEvent::Progress {
-                scan_id: scan_id.clone(),
-                processed: 0,
-                discovered: Some(entries.len()),
-                total_estimated: None,
-                current_path,
-                phase: Some("walking".to_string()),
-            });
-        }
-    }
-
-    let total_entries = entries.len();
-    metrics.total_entries = total_entries;
-
-    progress_callback(ScanEvent::Progress {
-        scan_id: scan_id.clone(),
-        processed: 0,
-        discovered: Some(total_entries),
-        total_estimated: Some(total_entries),
-        current_path: root.to_string_lossy().to_string(),
-        phase: Some("processing".to_string()),
-    })?;
-
+    tracing::info!("[{}] 开始流式遍历目录...", scan_id);
     let mut dir_sizes: HashMap<PathBuf, (u64, u64)> = HashMap::new();
-    let mut large_files: Vec<FileInfo> = Vec::new();
+    let mut selected_files: Vec<FileInfo> = Vec::new();
     let mut total_logical_size: u64 = 0;
     let mut total_disk_usage: u64 = 0;
     let use_disk_mode = size_mode == Some("disk");
-
+    let mut matched_files_found = 0usize;
     let dir_calc_start = Instant::now();
-    let mut processed = 0usize;
-    const CHUNK_SIZE: usize = 10_000;
+    let mut discovered_entries = 0usize;
+    let mut last_progress_emit = Instant::now();
 
-    for chunk in entries.chunks(CHUNK_SIZE) {
+    for entry in WalkDir::new(root).follow_links(false).min_depth(1).into_iter() {
         if cancel_flag.load(Ordering::SeqCst) {
             progress_callback(ScanEvent::Cancelled {
                 scan_id: scan_id.clone(),
             })?;
             return Err("扫描被取消".into());
         }
+        let Ok(entry) = entry else {
+            metrics.skipped_entries += 1;
+            continue;
+        };
 
-        #[derive(Default)]
-        struct ChunkAcc {
-            files: Vec<FileInfo>,
-            dirs: HashMap<PathBuf, (u64, u64)>,
-            total_logical_size: u64,
-            total_disk_usage: u64,
-            skipped: usize,
-        }
+        discovered_entries += 1;
+        metrics.total_entries = discovered_entries;
+        let current_path = entry.path().to_string_lossy().to_string();
 
-        #[derive(Debug)]
-        struct CancelledError;
-        impl std::fmt::Display for CancelledError {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "扫描被取消")
-            }
-        }
-        impl std::error::Error for CancelledError {}
-
-        let chunk_result: Result<ChunkAcc, CancelledError> = chunk
-            .par_iter()
-            .try_fold(ChunkAcc::default, |mut acc, entry| {
-                if cancel_flag.load(Ordering::Relaxed) {
-                    return Err(CancelledError);
-                }
-
-                let metadata = match entry.metadata() {
-                    Ok(m) => m,
-                    Err(_) => {
-                        acc.skipped += 1;
-                        return Ok(acc);
-                    }
-                };
-
-                if !metadata.is_file() {
-                    return Ok(acc);
-                }
-
-                let size = metadata.len();
-                let disk_usage = {
-                    let blocks = metadata.blocks();
-                    if blocks == 0 {
-                        size
-                    } else {
-                        blocks * 512
-                    }
-                };
-                acc.total_logical_size = acc.total_logical_size.saturating_add(size);
-                acc.total_disk_usage = acc.total_disk_usage.saturating_add(disk_usage);
-
-                let mut current = entry.path().parent();
-                while let Some(parent) = current {
-                    if !parent.starts_with(root) {
-                        break;
-                    }
-                    let key = parent.to_path_buf();
-                    let v = acc.dirs.entry(key).or_insert((0, 0));
-                    v.0 = v.0.saturating_add(size);
-                    v.1 = v.1.saturating_add(disk_usage);
-                    if parent == root {
-                        break;
-                    }
-                    current = parent.parent();
-                }
-
-                let active_size = if use_disk_mode { disk_usage } else { size };
-                if min_size.map_or(true, |min| active_size >= min) {
-                    if let Ok(info) =
-                        create_file_info_from_metadata(entry.path(), size, false, &metadata)
-                    {
-                        acc.files.push(info);
-                    }
-                }
-
-                Ok(acc)
-            })
-            .try_reduce(ChunkAcc::default, |mut a, mut b| {
-                a.files.append(&mut b.files);
-                a.total_logical_size = a.total_logical_size.saturating_add(b.total_logical_size);
-                a.total_disk_usage = a.total_disk_usage.saturating_add(b.total_disk_usage);
-                a.skipped += b.skipped;
-                for (k, v) in b.dirs {
-                    let e = a.dirs.entry(k).or_insert((0, 0));
-                    e.0 = e.0.saturating_add(v.0);
-                    e.1 = e.1.saturating_add(v.1);
-                }
-                Ok(a)
-            });
-
-        match chunk_result {
-            Ok(acc) => {
-                large_files.extend(acc.files);
-                total_logical_size = total_logical_size.saturating_add(acc.total_logical_size);
-                total_disk_usage = total_disk_usage.saturating_add(acc.total_disk_usage);
-                metrics.skipped_entries += acc.skipped;
-                for (k, v) in acc.dirs {
-                    let entry = dir_sizes.entry(k).or_insert((0, 0));
-                    entry.0 = entry.0.saturating_add(v.0);
-                    entry.1 = entry.1.saturating_add(v.1);
-                }
-            }
+        let metadata_start = Instant::now();
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
             Err(_) => {
-                progress_callback(ScanEvent::Cancelled {
-                    scan_id: scan_id.clone(),
-                })?;
-                return Err("扫描被取消".into());
+                metrics.metadata_read_time += metadata_start.elapsed().as_nanos();
+                metrics.skipped_entries += 1;
+                maybe_emit_progress(
+                    &mut progress_callback,
+                    &scan_id,
+                    &mut last_progress_emit,
+                    discovered_entries,
+                    &current_path,
+                )?;
+                continue;
+            }
+        };
+        metrics.metadata_read_time += metadata_start.elapsed().as_nanos();
+
+        if metadata.is_dir() {
+            metrics.dirs_processed += 1;
+        } else if metadata.is_file() {
+            metrics.files_processed += 1;
+
+            let size = metadata.len();
+            let disk_usage = compute_disk_usage(size, &metadata);
+            total_logical_size = total_logical_size.saturating_add(size);
+            total_disk_usage = total_disk_usage.saturating_add(disk_usage);
+
+            accumulate_parent_sizes(root, entry.path(), size, disk_usage, &mut dir_sizes);
+
+            let active_size = if use_disk_mode { disk_usage } else { size };
+            if min_size.map_or(true, |min| active_size >= min) {
+                matched_files_found += 1;
+                if let Ok(info) =
+                    create_file_info_from_metadata(entry.path(), size, false, &metadata)
+                {
+                    retain_top_files(&mut selected_files, info, limit, use_disk_mode);
+                }
             }
         }
 
-        processed += chunk.len();
-        let current_path = chunk
-            .last()
-            .map(|e| e.path().to_string_lossy().to_string())
-            .unwrap_or_else(|| root.to_string_lossy().to_string());
-        let _ = progress_callback(ScanEvent::Progress {
-            scan_id: scan_id.clone(),
-            processed,
-            discovered: Some(total_entries),
-            total_estimated: Some(total_entries),
-            current_path,
-            phase: Some("processing".to_string()),
-        });
+        maybe_emit_progress(
+            &mut progress_callback,
+            &scan_id,
+            &mut last_progress_emit,
+            discovered_entries,
+            &current_path,
+        )?;
     }
 
     metrics.dir_calc_time = dir_calc_start.elapsed().as_nanos();
-    metrics.files_processed = large_files.len();
+
+    progress_callback(ScanEvent::Progress {
+        scan_id: scan_id.clone(),
+        processed: discovered_entries,
+        discovered: Some(discovered_entries),
+        total_estimated: Some(discovered_entries),
+        current_path: root.to_string_lossy().to_string(),
+        phase: Some("processing".to_string()),
+    })?;
 
     // 收集符合大小要求的目录。前端现在会构建可展开树形表格，
     // 因此不能再过滤掉已选父目录下面的子项。
@@ -328,30 +225,18 @@ where
 
     let sort_start = Instant::now();
     let active_tuple_size = |logical: u64, disk: u64| if use_disk_mode { disk } else { logical };
-    let active_file_size = |file: &FileInfo| {
-        if use_disk_mode {
-            file.size_disk
-        } else {
-            file.size_logical
-        }
-    };
-
     all_dirs.sort_by(|a, b| {
         active_tuple_size(b.1, b.2)
             .cmp(&active_tuple_size(a.1, a.2))
             .then_with(|| a.0.cmp(&b.0))
     });
 
-    large_files.sort_by(|a, b| {
-        active_file_size(b)
-            .cmp(&active_file_size(a))
-            .then_with(|| a.path.cmp(&b.path))
-    });
+    selected_files.sort_by(|a, b| compare_file_info(a, b, use_disk_mode));
 
-    let total_files_found = large_files.len();
+    let total_files_found = matched_files_found;
     let total_directories_found = all_dirs.len();
 
-    let mut final_files = large_files;
+    let mut final_files = selected_files;
     if let Some(l) = limit {
         final_files.truncate(l);
     }
@@ -386,11 +271,7 @@ where
         .filter(|item| item.is_dir)
         .cloned()
         .collect();
-    final_dirs.sort_by(|a, b| {
-        active_file_size(b)
-            .cmp(&active_file_size(a))
-            .then_with(|| a.path.cmp(&b.path))
-    });
+    final_dirs.sort_by(|a, b| compare_file_info(a, b, use_disk_mode));
     metrics.sorting_time = sort_start.elapsed().as_nanos();
 
     metrics.finish();
@@ -404,11 +285,7 @@ where
 
     let mut results = final_files.clone();
     results.extend(final_dirs.clone());
-    results.sort_by(|a, b| {
-        active_file_size(b)
-            .cmp(&active_file_size(a))
-            .then_with(|| a.path.cmp(&b.path))
-    });
+    results.sort_by(|a, b| compare_file_info(a, b, use_disk_mode));
 
     progress_callback(ScanEvent::Completed {
         scan_id: scan_id.clone(),
@@ -422,6 +299,125 @@ where
     })?;
 
     Ok((final_files, final_dirs, total_size))
+}
+
+fn maybe_emit_progress<F>(
+    progress_callback: &mut F,
+    scan_id: &str,
+    last_progress_emit: &mut Instant,
+    processed: usize,
+    current_path: &str,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: FnMut(ScanEvent) -> Result<(), Box<dyn std::error::Error>>,
+{
+    if processed % 500 == 0 || last_progress_emit.elapsed().as_millis() >= 300 {
+        *last_progress_emit = Instant::now();
+        progress_callback(ScanEvent::Progress {
+            scan_id: scan_id.to_string(),
+            processed,
+            discovered: Some(processed),
+            total_estimated: None,
+            current_path: current_path.to_string(),
+            phase: Some("walking".to_string()),
+        })?;
+    }
+
+    Ok(())
+}
+
+fn accumulate_parent_sizes(
+    root: &Path,
+    path: &Path,
+    size: u64,
+    disk_usage: u64,
+    dir_sizes: &mut HashMap<PathBuf, (u64, u64)>,
+) {
+    let mut current = path.parent();
+    while let Some(parent) = current {
+        if !parent.starts_with(root) {
+            break;
+        }
+        let entry = dir_sizes.entry(parent.to_path_buf()).or_insert((0, 0));
+        entry.0 = entry.0.saturating_add(size);
+        entry.1 = entry.1.saturating_add(disk_usage);
+        if parent == root {
+            break;
+        }
+        current = parent.parent();
+    }
+}
+
+fn compute_disk_usage(size: u64, metadata: &std::fs::Metadata) -> u64 {
+    let blocks = metadata.blocks();
+    if blocks == 0 {
+        size
+    } else {
+        blocks * 512
+    }
+}
+
+fn compare_file_info(a: &FileInfo, b: &FileInfo, use_disk_mode: bool) -> std::cmp::Ordering {
+    let a_size = if use_disk_mode {
+        a.size_disk
+    } else {
+        a.size_logical
+    };
+    let b_size = if use_disk_mode {
+        b.size_disk
+    } else {
+        b.size_logical
+    };
+
+    b_size.cmp(&a_size).then_with(|| a.path.cmp(&b.path))
+}
+
+fn retain_top_files(
+    selected_files: &mut Vec<FileInfo>,
+    candidate: FileInfo,
+    limit: Option<usize>,
+    use_disk_mode: bool,
+) {
+    let Some(limit) = limit else {
+        selected_files.push(candidate);
+        return;
+    };
+
+    if limit == 0 {
+        return;
+    }
+
+    if selected_files.len() < limit {
+        selected_files.push(candidate);
+        return;
+    }
+
+    let weakest_index = selected_files
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            let a_size = if use_disk_mode {
+                a.size_disk
+            } else {
+                a.size_logical
+            };
+            let b_size = if use_disk_mode {
+                b.size_disk
+            } else {
+                b.size_logical
+            };
+
+            a_size.cmp(&b_size).then_with(|| b.path.cmp(&a.path))
+        })
+        .map(|(index, _)| index);
+
+    if let Some(index) = weakest_index {
+        if compare_file_info(&candidate, &selected_files[index], use_disk_mode)
+            == std::cmp::Ordering::Less
+        {
+            selected_files[index] = candidate;
+        }
+    }
 }
 
 fn add_ancestor_dirs(
@@ -465,14 +461,7 @@ fn create_file_info_from_metadata(
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| path.to_string_lossy().to_string());
 
-    let disk_usage = {
-        let blocks = metadata.blocks();
-        if blocks == 0 {
-            size
-        } else {
-            blocks * 512
-        }
-    };
+    let disk_usage = compute_disk_usage(size, metadata);
 
     Ok(FileInfo {
         path: path.to_string_lossy().to_string(),
@@ -643,5 +632,24 @@ mod tests {
         assert!(results
             .iter()
             .any(|item| item.path == ancestor_c.to_string_lossy()));
+    }
+
+    #[test]
+    fn file_limit_keeps_largest_matching_files() {
+        let dir = TestDir::new("topk");
+        let _small = dir.write_file("small.bin", 8);
+        let medium = dir.write_file("medium.bin", 64);
+        let large = dir.write_file("large.bin", 128);
+
+        let results = scan_directory(&dir.path, Some(2), None, Some("logical")).unwrap();
+        let file_paths = results
+            .iter()
+            .filter(|item| !item.is_dir)
+            .map(|item| item.path.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(file_paths.len(), 2);
+        assert!(file_paths.contains(&medium.to_string_lossy().to_string()));
+        assert!(file_paths.contains(&large.to_string_lossy().to_string()));
     }
 }

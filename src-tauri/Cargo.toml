@@ -20,7 +20,6 @@ tauri-plugin-dialog = { version = "2.0", features = [] }
 tauri-plugin-shell = { version = "2.0" }
 walkdir = "2.5"  # 用于目录遍历
 tracing = "0.1"  # 日志记录
-rayon = "1.10"   # 并行处理
 lru = "0.12"     # LRU缓存
 uuid = { version = "1.10", features = ["v4", "serde"] }
 tokio = { version = "1.0", features = ["sync", "rt-multi-thread"] }

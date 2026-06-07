@@ -19,6 +19,7 @@ interface FileListProps {
   sessionKey: number;
   scanRoot: string;
   isPreview: boolean;
+  focusedPath?: string | null;
   onDelete: (file: FileInfo) => void;
   onShowInFinder: (file: FileInfo) => void;
   onCopyPath: (file: FileInfo) => void;
@@ -172,6 +173,7 @@ export default function FileList({
   sessionKey,
   scanRoot,
   isPreview,
+  focusedPath,
   onDelete,
   onShowInFinder,
   onCopyPath,
@@ -212,6 +214,26 @@ export default function FileList({
       setViewPath(normalizedRoot);
     }
   }, [nodeMap, normalizedRoot, viewPath]);
+
+  useEffect(() => {
+    if (!focusedPath) return;
+
+    const normalizedFocusedPath = normalizePath(focusedPath);
+    const focusedFile = files.find(
+      (file) => normalizePath(file.path) === normalizedFocusedPath,
+    );
+    if (!focusedFile) return;
+
+    setSelectedPath(focusedFile.path);
+    setOpenMenuPath(null);
+
+    if (focusedFile.is_dir) {
+      setViewPath(focusedFile.path);
+      return;
+    }
+
+    setViewPath(getParentPath(focusedFile.path) ?? normalizedRoot);
+  }, [files, focusedPath, normalizedRoot]);
 
   const branchNodes = useMemo(() => {
     if (viewPath === normalizedRoot) {

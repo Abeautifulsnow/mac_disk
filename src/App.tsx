@@ -2,15 +2,18 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
   CheckCircle,
+  Filter,
   FolderOpen,
   HardDrive,
   Loader2,
   XCircle,
 } from "lucide-react";
-import { startTransition, useEffect, useRef, useState } from "react";
+import { startTransition, useEffect, useMemo, useRef, useState } from "react";
 import ConfirmDialog from "./components/ConfirmDialog";
 import FileList from "./components/FileList";
+import ScanInsights from "./components/ScanInsights";
 import Scanner from "./components/Scanner";
+import { categorizeFile } from "./scanInsights";
 import type { FileInfo, ScanEvent, ScanProgress } from "./types";
 
 function sortBySize(
@@ -45,6 +48,8 @@ function App() {
   const [sizeMode, setSizeMode] = useState<"logical" | "disk">("logical");
   const [scanRoot, setScanRoot] = useState("/Users");
   const [listSessionKey, setListSessionKey] = useState(0);
+  const [focusedResultPath, setFocusedResultPath] = useState<string | null>(null);
+  const [activeTypeFilter, setActiveTypeFilter] = useState<string | null>(null);
 
   // 使用 ref 来跟踪最新的 currentScanId，避免闭包问题
   const currentScanIdRef = useRef<string | null>(null);
@@ -324,6 +329,8 @@ function App() {
     setScanProgress(null);
     setScanStats(null);
     setTerminalState(null);
+    setFocusedResultPath(null);
+    setActiveTypeFilter(null);
     setLastTimeoutSeconds(timeoutSeconds);
     setScanRoot(path);
     setListSessionKey((current) => current + 1);
@@ -460,6 +467,15 @@ function App() {
             (!confirmDelete.is_dir || !f.path.startsWith(deletedPathPrefix)),
         ),
       );
+      setFocusedResultPath((current) =>
+        current === confirmDelete.path ? null : current,
+      );
+      setActiveTypeFilter((current) => {
+        if (!current) return current;
+        return removedItems.some((item) => categorizeFile(item) === current)
+          ? current
+          : current;
+      });
       setScanStats((currentStats) => {
         if (!currentStats) return currentStats;
 
@@ -518,6 +534,11 @@ function App() {
     (scanStats?.filesFound ?? 0) + (scanStats?.directoriesFound ?? 0);
   const isPreviewResults = loading && files.length > 0;
   const previewItemCount = files.length;
+  const displayedFiles = useMemo(() => {
+    if (!activeTypeFilter) return files;
+    return files.filter((file) => categorizeFile(file) === activeTypeFilter);
+  }, [activeTypeFilter, files]);
+  const displayedItemCount = displayedFiles.length;
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -552,6 +573,11 @@ function App() {
                   当前展示: {scanStats.resultCount.toLocaleString()} /{" "}
                   {totalItems.toLocaleString()} 个项目
                 </div>
+                {activeTypeFilter && (
+                  <div className="text-xs text-blue-600 leading-tight">
+                    已筛选类型: {activeTypeFilter} ({displayedItemCount.toLocaleString()} 项)
+                  </div>
+                )}
               </>
             ) : isPreviewResults ? (
               <>
@@ -610,18 +636,46 @@ function App() {
                 </p>
               </div>
             ) : files.length > 0 ? (
-              <FileList
-                files={files}
-                sessionKey={listSessionKey}
-                scanRoot={scanRoot}
-                isPreview={isPreviewResults}
-                onDelete={handleDelete}
-                onShowInFinder={handleShowInFinder}
-                onCopyPath={handleCopyPath}
-                onRescanDirectory={handleRescanDirectory}
-                formatFileSize={formatFileSize}
-                sizeMode={sizeMode}
-              />
+              <>
+                {!isPreviewResults && (
+                  <ScanInsights
+                    files={files}
+                    sizeMode={sizeMode}
+                    formatFileSize={formatFileSize}
+                    onFocusPath={setFocusedResultPath}
+                    activeTypeFilter={activeTypeFilter}
+                    onTypeFilterChange={setActiveTypeFilter}
+                  />
+                )}
+                {activeTypeFilter && (
+                  <div className="mb-4 flex items-center justify-between rounded-lg border border-blue-200 bg-blue-50 px-4 py-3">
+                    <div className="flex items-center gap-2 text-sm text-blue-800">
+                      <Filter className="h-4 w-4" />
+                      当前仅显示类型: {activeTypeFilter}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setActiveTypeFilter(null)}
+                      className="rounded-md border border-blue-200 bg-white px-3 py-1.5 text-xs font-medium text-blue-700 transition-colors hover:bg-blue-100"
+                    >
+                      清除筛选
+                    </button>
+                  </div>
+                )}
+                <FileList
+                  files={displayedFiles}
+                  sessionKey={listSessionKey}
+                  scanRoot={scanRoot}
+                  isPreview={isPreviewResults}
+                  focusedPath={focusedResultPath}
+                  onDelete={handleDelete}
+                  onShowInFinder={handleShowInFinder}
+                  onCopyPath={handleCopyPath}
+                  onRescanDirectory={handleRescanDirectory}
+                  formatFileSize={formatFileSize}
+                  sizeMode={sizeMode}
+                />
+              </>
             ) : (
               <div className="text-center py-12">
                 <FolderOpen className="h-16 w-16 text-gray-300 mx-auto mb-4" />

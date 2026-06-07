@@ -54,6 +54,9 @@ const LIST_PANEL_MIN_HEIGHT = 420;
 const FLAT_ROW_HEIGHT = 76;
 const FLAT_OVERSCAN = 8;
 const RESULT_VIEW_MODE_STORAGE_KEY = "mac-disk-scanner.result-view-mode";
+const FLAT_SORT_MODE_STORAGE_KEY = "mac-disk-scanner.flat-sort-mode";
+
+type FlatSortMode = "size" | "modified" | "name";
 
 function normalizePath(path: string): string {
   if (path === "/") return "/";
@@ -184,6 +187,14 @@ function getStoredViewMode(): "tree" | "flat" {
   return stored === "flat" ? "flat" : "tree";
 }
 
+function getStoredFlatSortMode(): FlatSortMode {
+  if (typeof window === "undefined") return "size";
+
+  const stored = window.localStorage.getItem(FLAT_SORT_MODE_STORAGE_KEY);
+  if (stored === "modified" || stored === "name") return stored;
+  return "size";
+}
+
 export default function FileList({
   files,
   sessionKey,
@@ -212,6 +223,7 @@ export default function FileList({
   const [flatScrollTop, setFlatScrollTop] = useState(0);
   const [flatViewportHeight, setFlatViewportHeight] = useState(LIST_PANEL_MIN_HEIGHT);
   const [flatSearchQuery, setFlatSearchQuery] = useState("");
+  const [flatSortMode, setFlatSortMode] = useState<FlatSortMode>(getStoredFlatSortMode);
 
   useEffect(() => {
     setExpandedPaths(new Set());
@@ -234,6 +246,10 @@ export default function FileList({
   useEffect(() => {
     window.localStorage.setItem(RESULT_VIEW_MODE_STORAGE_KEY, viewMode);
   }, [viewMode]);
+
+  useEffect(() => {
+    window.localStorage.setItem(FLAT_SORT_MODE_STORAGE_KEY, flatSortMode);
+  }, [flatSortMode]);
 
   useEffect(() => {
     if (viewPath === normalizedRoot) return;
@@ -290,11 +306,22 @@ export default function FileList({
   );
   const flatFiles = useMemo(
     () => [...files].sort((a, b) => {
-      const sizeDelta = getSizeValue(b, sizeMode) - getSizeValue(a, sizeMode);
-      if (sizeDelta !== 0) return sizeDelta;
+      if (flatSortMode === "modified") {
+        const modifiedDelta = (b.modified ?? 0) - (a.modified ?? 0);
+        if (modifiedDelta !== 0) return modifiedDelta;
+      } else if (flatSortMode === "name") {
+        const nameDelta = a.name.localeCompare(b.name);
+        if (nameDelta !== 0) return nameDelta;
+      } else {
+        const sizeDelta = getSizeValue(b, sizeMode) - getSizeValue(a, sizeMode);
+        if (sizeDelta !== 0) return sizeDelta;
+      }
+
+      const fallbackSizeDelta = getSizeValue(b, sizeMode) - getSizeValue(a, sizeMode);
+      if (fallbackSizeDelta !== 0) return fallbackSizeDelta;
       return a.path.localeCompare(b.path);
     }),
-    [files, sizeMode],
+    [files, flatSortMode, sizeMode],
   );
   const normalizedFlatSearchQuery = flatSearchQuery.trim().toLowerCase();
   const filteredFlatFiles = useMemo(() => {
@@ -393,7 +420,7 @@ export default function FileList({
     if (viewMode !== "flat") return;
     setFlatScrollTop(0);
     flatContainerRef.current?.scrollTo({ top: 0 });
-  }, [normalizedFlatSearchQuery, viewMode]);
+  }, [flatSortMode, normalizedFlatSearchQuery, viewMode]);
 
   const renderItemActions = (item: FileInfo, hasChildren: boolean) => (
     <div className="relative flex justify-end">
@@ -575,26 +602,63 @@ export default function FileList({
 
           {viewMode === "flat" && (
             <div className="flex items-center justify-between gap-3 border-b border-gray-200 bg-gray-50 px-6 py-3">
-              <label className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-gray-200 bg-white px-3 py-2">
-                <Search className="h-4 w-4 flex-shrink-0 text-gray-400" />
-                <input
-                  type="text"
-                  value={flatSearchQuery}
-                  onChange={(event) => setFlatSearchQuery(event.target.value)}
-                  placeholder="搜索名称或路径"
-                  className="min-w-0 flex-1 bg-transparent text-sm text-gray-900 outline-none placeholder:text-gray-400"
-                />
-                {flatSearchQuery && (
+              <div className="flex min-w-0 flex-1 items-center gap-3">
+                <label className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-gray-200 bg-white px-3 py-2">
+                  <Search className="h-4 w-4 flex-shrink-0 text-gray-400" />
+                  <input
+                    type="text"
+                    value={flatSearchQuery}
+                    onChange={(event) => setFlatSearchQuery(event.target.value)}
+                    placeholder="搜索名称或路径"
+                    className="min-w-0 flex-1 bg-transparent text-sm text-gray-900 outline-none placeholder:text-gray-400"
+                  />
+                  {flatSearchQuery && (
+                    <button
+                      type="button"
+                      onClick={() => setFlatSearchQuery("")}
+                      className="inline-flex h-5 w-5 items-center justify-center rounded text-gray-400 hover:bg-gray-100 hover:text-gray-600"
+                      title="清空搜索"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  )}
+                </label>
+                <div className="inline-flex rounded-md border border-gray-200 bg-white p-0.5">
                   <button
                     type="button"
-                    onClick={() => setFlatSearchQuery("")}
-                    className="inline-flex h-5 w-5 items-center justify-center rounded text-gray-400 hover:bg-gray-100 hover:text-gray-600"
-                    title="清空搜索"
+                    onClick={() => setFlatSortMode("size")}
+                    className={`rounded px-2.5 py-1.5 text-xs font-medium ${
+                      flatSortMode === "size"
+                        ? "bg-blue-50 text-blue-700"
+                        : "text-gray-600 hover:bg-gray-50"
+                    }`}
                   >
-                    <X className="h-3.5 w-3.5" />
+                    按大小
                   </button>
-                )}
-              </label>
+                  <button
+                    type="button"
+                    onClick={() => setFlatSortMode("modified")}
+                    className={`rounded px-2.5 py-1.5 text-xs font-medium ${
+                      flatSortMode === "modified"
+                        ? "bg-blue-50 text-blue-700"
+                        : "text-gray-600 hover:bg-gray-50"
+                    }`}
+                  >
+                    按时间
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setFlatSortMode("name")}
+                    className={`rounded px-2.5 py-1.5 text-xs font-medium ${
+                      flatSortMode === "name"
+                        ? "bg-blue-50 text-blue-700"
+                        : "text-gray-600 hover:bg-gray-50"
+                    }`}
+                  >
+                    按名称
+                  </button>
+                </div>
+              </div>
               <div className="text-xs text-gray-500">
                 {filteredFlatFiles.length.toLocaleString()} / {flatFiles.length.toLocaleString()} 项
               </div>

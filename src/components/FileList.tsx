@@ -55,8 +55,17 @@ const FLAT_ROW_HEIGHT = 76;
 const FLAT_OVERSCAN = 8;
 const RESULT_VIEW_MODE_STORAGE_KEY = "mac-disk-scanner.result-view-mode";
 const FLAT_SORT_MODE_STORAGE_KEY = "mac-disk-scanner.flat-sort-mode";
+const FLAT_SIZE_FILTER_STORAGE_KEY = "mac-disk-scanner.flat-size-filter";
+const FLAT_MODIFIED_FILTER_STORAGE_KEY = "mac-disk-scanner.flat-modified-filter";
+
+const SIZE_100_MB = 100 * 1024 * 1024;
+const SIZE_1_GB = 1024 * 1024 * 1024;
+const SIZE_10_GB = 10 * 1024 * 1024 * 1024;
+const SECONDS_IN_DAY = 24 * 60 * 60;
 
 type FlatSortMode = "size" | "modified" | "name";
+type FlatSizeFilter = "all" | "100mb" | "1gb" | "10gb";
+type FlatModifiedFilter = "all" | "30d" | "180d" | "365d";
 
 function normalizePath(path: string): string {
   if (path === "/") return "/";
@@ -195,6 +204,48 @@ function getStoredFlatSortMode(): FlatSortMode {
   return "size";
 }
 
+function getStoredFlatSizeFilter(): FlatSizeFilter {
+  if (typeof window === "undefined") return "all";
+
+  const stored = window.localStorage.getItem(FLAT_SIZE_FILTER_STORAGE_KEY);
+  if (stored === "100mb" || stored === "1gb" || stored === "10gb") return stored;
+  return "all";
+}
+
+function getStoredFlatModifiedFilter(): FlatModifiedFilter {
+  if (typeof window === "undefined") return "all";
+
+  const stored = window.localStorage.getItem(FLAT_MODIFIED_FILTER_STORAGE_KEY);
+  if (stored === "30d" || stored === "180d" || stored === "365d") return stored;
+  return "all";
+}
+
+function matchesFlatSizeFilter(
+  item: FileInfo,
+  sizeMode: "logical" | "disk",
+  filter: FlatSizeFilter,
+) {
+  const size = getSizeValue(item, sizeMode);
+  if (filter === "100mb") return size >= SIZE_100_MB;
+  if (filter === "1gb") return size >= SIZE_1_GB;
+  if (filter === "10gb") return size >= SIZE_10_GB;
+  return true;
+}
+
+function matchesFlatModifiedFilter(
+  item: FileInfo,
+  filter: FlatModifiedFilter,
+  nowSeconds: number,
+) {
+  if (filter === "all") return true;
+  if (!item.modified) return false;
+
+  const ageSeconds = nowSeconds - item.modified;
+  if (filter === "30d") return ageSeconds <= 30 * SECONDS_IN_DAY;
+  if (filter === "180d") return ageSeconds <= 180 * SECONDS_IN_DAY;
+  return ageSeconds <= 365 * SECONDS_IN_DAY;
+}
+
 export default function FileList({
   files,
   sessionKey,
@@ -224,6 +275,10 @@ export default function FileList({
   const [flatViewportHeight, setFlatViewportHeight] = useState(LIST_PANEL_MIN_HEIGHT);
   const [flatSearchQuery, setFlatSearchQuery] = useState("");
   const [flatSortMode, setFlatSortMode] = useState<FlatSortMode>(getStoredFlatSortMode);
+  const [flatSizeFilter, setFlatSizeFilter] = useState<FlatSizeFilter>(getStoredFlatSizeFilter);
+  const [flatModifiedFilter, setFlatModifiedFilter] = useState<FlatModifiedFilter>(
+    getStoredFlatModifiedFilter,
+  );
 
   useEffect(() => {
     setExpandedPaths(new Set());
@@ -250,6 +305,14 @@ export default function FileList({
   useEffect(() => {
     window.localStorage.setItem(FLAT_SORT_MODE_STORAGE_KEY, flatSortMode);
   }, [flatSortMode]);
+
+  useEffect(() => {
+    window.localStorage.setItem(FLAT_SIZE_FILTER_STORAGE_KEY, flatSizeFilter);
+  }, [flatSizeFilter]);
+
+  useEffect(() => {
+    window.localStorage.setItem(FLAT_MODIFIED_FILTER_STORAGE_KEY, flatModifiedFilter);
+  }, [flatModifiedFilter]);
 
   useEffect(() => {
     if (viewPath === normalizedRoot) return;
@@ -324,10 +387,19 @@ export default function FileList({
     [files, flatSortMode, sizeMode],
   );
   const normalizedFlatSearchQuery = flatSearchQuery.trim().toLowerCase();
+  const nowSeconds = Date.now() / 1000;
   const filteredFlatFiles = useMemo(() => {
-    if (!normalizedFlatSearchQuery) return flatFiles;
-
     return flatFiles.filter((item) => {
+      if (!matchesFlatSizeFilter(item, sizeMode, flatSizeFilter)) {
+        return false;
+      }
+
+      if (!matchesFlatModifiedFilter(item, flatModifiedFilter, nowSeconds)) {
+        return false;
+      }
+
+      if (!normalizedFlatSearchQuery) return true;
+
       const lowerName = item.name.toLowerCase();
       const lowerPath = item.path.toLowerCase();
       return (
@@ -335,7 +407,14 @@ export default function FileList({
         lowerPath.includes(normalizedFlatSearchQuery)
       );
     });
-  }, [flatFiles, normalizedFlatSearchQuery]);
+  }, [
+    flatFiles,
+    flatModifiedFilter,
+    flatSizeFilter,
+    normalizedFlatSearchQuery,
+    nowSeconds,
+    sizeMode,
+  ]);
 
   const totalSize = useMemo(
     () =>
@@ -392,6 +471,8 @@ export default function FileList({
   const visibleFlatFiles = filteredFlatFiles.slice(flatStartIndex, flatEndIndex);
   const flatOffsetTop = flatStartIndex * FLAT_ROW_HEIGHT;
   const flatTotalHeight = filteredFlatFiles.length * FLAT_ROW_HEIGHT;
+  const hasActiveFlatFilters =
+    flatSizeFilter !== "all" || flatModifiedFilter !== "all" || normalizedFlatSearchQuery.length > 0;
 
   useEffect(() => {
     if (viewMode !== "flat" || !selectedPath || !flatContainerRef.current) return;
@@ -420,7 +501,13 @@ export default function FileList({
     if (viewMode !== "flat") return;
     setFlatScrollTop(0);
     flatContainerRef.current?.scrollTo({ top: 0 });
-  }, [flatSortMode, normalizedFlatSearchQuery, viewMode]);
+  }, [
+    flatModifiedFilter,
+    flatSizeFilter,
+    flatSortMode,
+    normalizedFlatSearchQuery,
+    viewMode,
+  ]);
 
   const renderItemActions = (item: FileInfo, hasChildren: boolean) => (
     <div className="relative flex justify-end">
@@ -601,66 +688,178 @@ export default function FileList({
           </div>
 
           {viewMode === "flat" && (
-            <div className="flex items-center justify-between gap-3 border-b border-gray-200 bg-gray-50 px-6 py-3">
-              <div className="flex min-w-0 flex-1 items-center gap-3">
-                <label className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-gray-200 bg-white px-3 py-2">
-                  <Search className="h-4 w-4 flex-shrink-0 text-gray-400" />
-                  <input
-                    type="text"
-                    value={flatSearchQuery}
-                    onChange={(event) => setFlatSearchQuery(event.target.value)}
-                    placeholder="搜索名称或路径"
-                    className="min-w-0 flex-1 bg-transparent text-sm text-gray-900 outline-none placeholder:text-gray-400"
-                  />
-                  {flatSearchQuery && (
+            <div className="flex flex-col gap-3 border-b border-gray-200 bg-gray-50 px-6 py-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex min-w-0 flex-1 items-center gap-3">
+                  <label className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-gray-200 bg-white px-3 py-2">
+                    <Search className="h-4 w-4 flex-shrink-0 text-gray-400" />
+                    <input
+                      type="text"
+                      value={flatSearchQuery}
+                      onChange={(event) => setFlatSearchQuery(event.target.value)}
+                      placeholder="搜索名称或路径"
+                      className="min-w-0 flex-1 bg-transparent text-sm text-gray-900 outline-none placeholder:text-gray-400"
+                    />
+                    {flatSearchQuery && (
+                      <button
+                        type="button"
+                        onClick={() => setFlatSearchQuery("")}
+                        className="inline-flex h-5 w-5 items-center justify-center rounded text-gray-400 hover:bg-gray-100 hover:text-gray-600"
+                        title="清空搜索"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    )}
+                  </label>
+                  <div className="inline-flex rounded-md border border-gray-200 bg-white p-0.5">
                     <button
                       type="button"
-                      onClick={() => setFlatSearchQuery("")}
-                      className="inline-flex h-5 w-5 items-center justify-center rounded text-gray-400 hover:bg-gray-100 hover:text-gray-600"
-                      title="清空搜索"
+                      onClick={() => setFlatSortMode("size")}
+                      className={`rounded px-2.5 py-1.5 text-xs font-medium ${
+                        flatSortMode === "size"
+                          ? "bg-blue-50 text-blue-700"
+                          : "text-gray-600 hover:bg-gray-50"
+                      }`}
                     >
-                      <X className="h-3.5 w-3.5" />
+                      按大小
                     </button>
-                  )}
-                </label>
+                    <button
+                      type="button"
+                      onClick={() => setFlatSortMode("modified")}
+                      className={`rounded px-2.5 py-1.5 text-xs font-medium ${
+                        flatSortMode === "modified"
+                          ? "bg-blue-50 text-blue-700"
+                          : "text-gray-600 hover:bg-gray-50"
+                      }`}
+                    >
+                      按时间
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setFlatSortMode("name")}
+                      className={`rounded px-2.5 py-1.5 text-xs font-medium ${
+                        flatSortMode === "name"
+                          ? "bg-blue-50 text-blue-700"
+                          : "text-gray-600 hover:bg-gray-50"
+                      }`}
+                    >
+                      按名称
+                    </button>
+                  </div>
+                </div>
+                <div className="text-xs text-gray-500">
+                  {filteredFlatFiles.length.toLocaleString()} / {flatFiles.length.toLocaleString()} 项
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
                 <div className="inline-flex rounded-md border border-gray-200 bg-white p-0.5">
                   <button
                     type="button"
-                    onClick={() => setFlatSortMode("size")}
+                    onClick={() => setFlatSizeFilter("all")}
                     className={`rounded px-2.5 py-1.5 text-xs font-medium ${
-                      flatSortMode === "size"
+                      flatSizeFilter === "all"
                         ? "bg-blue-50 text-blue-700"
                         : "text-gray-600 hover:bg-gray-50"
                     }`}
                   >
-                    按大小
+                    全部体积
                   </button>
                   <button
                     type="button"
-                    onClick={() => setFlatSortMode("modified")}
+                    onClick={() => setFlatSizeFilter("100mb")}
                     className={`rounded px-2.5 py-1.5 text-xs font-medium ${
-                      flatSortMode === "modified"
+                      flatSizeFilter === "100mb"
                         ? "bg-blue-50 text-blue-700"
                         : "text-gray-600 hover:bg-gray-50"
                     }`}
                   >
-                    按时间
+                    ≥ 100 MB
                   </button>
                   <button
                     type="button"
-                    onClick={() => setFlatSortMode("name")}
+                    onClick={() => setFlatSizeFilter("1gb")}
                     className={`rounded px-2.5 py-1.5 text-xs font-medium ${
-                      flatSortMode === "name"
+                      flatSizeFilter === "1gb"
                         ? "bg-blue-50 text-blue-700"
                         : "text-gray-600 hover:bg-gray-50"
                     }`}
                   >
-                    按名称
+                    ≥ 1 GB
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setFlatSizeFilter("10gb")}
+                    className={`rounded px-2.5 py-1.5 text-xs font-medium ${
+                      flatSizeFilter === "10gb"
+                        ? "bg-blue-50 text-blue-700"
+                        : "text-gray-600 hover:bg-gray-50"
+                    }`}
+                  >
+                    ≥ 10 GB
                   </button>
                 </div>
-              </div>
-              <div className="text-xs text-gray-500">
-                {filteredFlatFiles.length.toLocaleString()} / {flatFiles.length.toLocaleString()} 项
+
+                <div className="inline-flex rounded-md border border-gray-200 bg-white p-0.5">
+                  <button
+                    type="button"
+                    onClick={() => setFlatModifiedFilter("all")}
+                    className={`rounded px-2.5 py-1.5 text-xs font-medium ${
+                      flatModifiedFilter === "all"
+                        ? "bg-blue-50 text-blue-700"
+                        : "text-gray-600 hover:bg-gray-50"
+                    }`}
+                  >
+                    全部时间
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setFlatModifiedFilter("30d")}
+                    className={`rounded px-2.5 py-1.5 text-xs font-medium ${
+                      flatModifiedFilter === "30d"
+                        ? "bg-blue-50 text-blue-700"
+                        : "text-gray-600 hover:bg-gray-50"
+                    }`}
+                  >
+                    近 30 天
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setFlatModifiedFilter("180d")}
+                    className={`rounded px-2.5 py-1.5 text-xs font-medium ${
+                      flatModifiedFilter === "180d"
+                        ? "bg-blue-50 text-blue-700"
+                        : "text-gray-600 hover:bg-gray-50"
+                    }`}
+                  >
+                    近半年
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setFlatModifiedFilter("365d")}
+                    className={`rounded px-2.5 py-1.5 text-xs font-medium ${
+                      flatModifiedFilter === "365d"
+                        ? "bg-blue-50 text-blue-700"
+                        : "text-gray-600 hover:bg-gray-50"
+                    }`}
+                  >
+                    近 1 年
+                  </button>
+                </div>
+
+                {hasActiveFlatFilters && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setFlatSearchQuery("");
+                      setFlatSizeFilter("all");
+                      setFlatModifiedFilter("all");
+                    }}
+                    className="rounded-md border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-700 hover:bg-gray-50"
+                  >
+                    清空筛选
+                  </button>
+                )}
               </div>
             </div>
           )}
@@ -814,11 +1013,11 @@ export default function FileList({
                 <div className="flex h-full min-h-[360px] items-center justify-center px-8">
                   <div className="text-center">
                     <div className="text-sm font-medium text-gray-900">
-                      {normalizedFlatSearchQuery ? "没有匹配的搜索结果" : "当前没有可展示项"}
+                      {hasActiveFlatFilters ? "没有匹配当前筛选条件的结果" : "当前没有可展示项"}
                     </div>
                     <div className="mt-1 text-sm text-gray-500">
-                      {normalizedFlatSearchQuery
-                        ? "尝试缩短关键词，或切换回树形视图继续查看"
+                      {hasActiveFlatFilters
+                        ? "放宽搜索、体积或时间条件后再试"
                         : "调整筛选条件，或重新扫描后再查看"}
                     </div>
                   </div>

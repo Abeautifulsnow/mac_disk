@@ -11,7 +11,9 @@ import {
   ListTree,
   MoreHorizontal,
   RotateCw,
+  Search,
   Trash2,
+  X,
 } from "lucide-react";
 
 import type { FileInfo } from "../types";
@@ -201,6 +203,7 @@ export default function FileList({
   const [openMenuPath, setOpenMenuPath] = useState<string | null>(null);
   const [flatScrollTop, setFlatScrollTop] = useState(0);
   const [flatViewportHeight, setFlatViewportHeight] = useState(LIST_PANEL_MIN_HEIGHT);
+  const [flatSearchQuery, setFlatSearchQuery] = useState("");
 
   useEffect(() => {
     setExpandedPaths(new Set());
@@ -208,6 +211,7 @@ export default function FileList({
     setSelectedPath(null);
     setOpenMenuPath(null);
     setFlatScrollTop(0);
+    setFlatSearchQuery("");
   }, [normalizedRoot, sessionKey]);
 
   useEffect(() => {
@@ -280,6 +284,19 @@ export default function FileList({
     }),
     [files, sizeMode],
   );
+  const normalizedFlatSearchQuery = flatSearchQuery.trim().toLowerCase();
+  const filteredFlatFiles = useMemo(() => {
+    if (!normalizedFlatSearchQuery) return flatFiles;
+
+    return flatFiles.filter((item) => {
+      const lowerName = item.name.toLowerCase();
+      const lowerPath = item.path.toLowerCase();
+      return (
+        lowerName.includes(normalizedFlatSearchQuery) ||
+        lowerPath.includes(normalizedFlatSearchQuery)
+      );
+    });
+  }, [flatFiles, normalizedFlatSearchQuery]);
 
   const totalSize = useMemo(
     () =>
@@ -287,8 +304,9 @@ export default function FileList({
     [branchNodes, sizeMode],
   );
   const flatTotalSize = useMemo(
-    () => flatFiles.reduce((sum, item) => sum + getSizeValue(item, sizeMode), 0),
-    [flatFiles, sizeMode],
+    () =>
+      filteredFlatFiles.reduce((sum, item) => sum + getSizeValue(item, sizeMode), 0),
+    [filteredFlatFiles, sizeMode],
   );
 
   const selectedFile =
@@ -329,17 +347,17 @@ export default function FileList({
     Math.floor(flatScrollTop / FLAT_ROW_HEIGHT) - FLAT_OVERSCAN,
   );
   const flatEndIndex = Math.min(
-    flatFiles.length,
+    filteredFlatFiles.length,
     Math.ceil((flatScrollTop + flatViewportHeight) / FLAT_ROW_HEIGHT) + FLAT_OVERSCAN,
   );
-  const visibleFlatFiles = flatFiles.slice(flatStartIndex, flatEndIndex);
+  const visibleFlatFiles = filteredFlatFiles.slice(flatStartIndex, flatEndIndex);
   const flatOffsetTop = flatStartIndex * FLAT_ROW_HEIGHT;
-  const flatTotalHeight = flatFiles.length * FLAT_ROW_HEIGHT;
+  const flatTotalHeight = filteredFlatFiles.length * FLAT_ROW_HEIGHT;
 
   useEffect(() => {
     if (viewMode !== "flat" || !selectedPath || !flatContainerRef.current) return;
 
-    const index = flatFiles.findIndex(
+    const index = filteredFlatFiles.findIndex(
       (item) => normalizePath(item.path) === normalizePath(selectedPath),
     );
     if (index === -1) return;
@@ -351,7 +369,19 @@ export default function FileList({
     flatContainerRef.current.scrollTo({
       top: Math.max(0, targetTop - flatViewportHeight / 2 + FLAT_ROW_HEIGHT / 2),
     });
-  }, [flatFiles, flatScrollTop, flatViewportHeight, selectedPath, viewMode]);
+  }, [
+    filteredFlatFiles,
+    flatScrollTop,
+    flatViewportHeight,
+    selectedPath,
+    viewMode,
+  ]);
+
+  useEffect(() => {
+    if (viewMode !== "flat") return;
+    setFlatScrollTop(0);
+    flatContainerRef.current?.scrollTo({ top: 0 });
+  }, [normalizedFlatSearchQuery, viewMode]);
 
   const renderItemActions = (item: FileInfo, hasChildren: boolean) => (
     <div className="relative flex justify-end">
@@ -531,6 +561,34 @@ export default function FileList({
             </div>
           </div>
 
+          {viewMode === "flat" && (
+            <div className="flex items-center justify-between gap-3 border-b border-gray-200 bg-gray-50 px-6 py-3">
+              <label className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-gray-200 bg-white px-3 py-2">
+                <Search className="h-4 w-4 flex-shrink-0 text-gray-400" />
+                <input
+                  type="text"
+                  value={flatSearchQuery}
+                  onChange={(event) => setFlatSearchQuery(event.target.value)}
+                  placeholder="搜索名称或路径"
+                  className="min-w-0 flex-1 bg-transparent text-sm text-gray-900 outline-none placeholder:text-gray-400"
+                />
+                {flatSearchQuery && (
+                  <button
+                    type="button"
+                    onClick={() => setFlatSearchQuery("")}
+                    className="inline-flex h-5 w-5 items-center justify-center rounded text-gray-400 hover:bg-gray-100 hover:text-gray-600"
+                    title="清空搜索"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                )}
+              </label>
+              <div className="text-xs text-gray-500">
+                {filteredFlatFiles.length.toLocaleString()} / {flatFiles.length.toLocaleString()} 项
+              </div>
+            </div>
+          )}
+
           {viewMode === "tree" ? (
             <div
               className="overflow-auto"
@@ -676,12 +734,16 @@ export default function FileList({
               style={{ height: LIST_PANEL_HEIGHT, minHeight: `${LIST_PANEL_MIN_HEIGHT}px` }}
               onScroll={(event) => setFlatScrollTop(event.currentTarget.scrollTop)}
             >
-              {flatFiles.length === 0 ? (
+              {filteredFlatFiles.length === 0 ? (
                 <div className="flex h-full min-h-[360px] items-center justify-center px-8">
                   <div className="text-center">
-                    <div className="text-sm font-medium text-gray-900">当前没有可展示项</div>
+                    <div className="text-sm font-medium text-gray-900">
+                      {normalizedFlatSearchQuery ? "没有匹配的搜索结果" : "当前没有可展示项"}
+                    </div>
                     <div className="mt-1 text-sm text-gray-500">
-                      调整筛选条件，或重新扫描后再查看
+                      {normalizedFlatSearchQuery
+                        ? "尝试缩短关键词，或切换回树形视图继续查看"
+                        : "调整筛选条件，或重新扫描后再查看"}
                     </div>
                   </div>
                 </div>

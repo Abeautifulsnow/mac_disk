@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import {
   Calendar,
   ChevronDown,
@@ -246,6 +246,22 @@ function matchesFlatModifiedFilter(
   return ageSeconds <= 365 * SECONDS_IN_DAY;
 }
 
+function isTextEntryTarget(target: EventTarget | null) {
+  if (!(target instanceof HTMLElement)) return false;
+
+  const tagName = target.tagName.toLowerCase();
+  return (
+    tagName === "input" ||
+    tagName === "textarea" ||
+    tagName === "select" ||
+    target.isContentEditable
+  );
+}
+
+function clampIndex(index: number, maxIndex: number) {
+  return Math.min(Math.max(index, 0), maxIndex);
+}
+
 export default function FileList({
   files,
   sessionKey,
@@ -265,7 +281,9 @@ export default function FileList({
     [files, normalizedRoot, sizeMode],
   );
 
+  const treeContainerRef = useRef<HTMLDivElement | null>(null);
   const flatContainerRef = useRef<HTMLDivElement | null>(null);
+  const selectedRowRef = useRef<HTMLElement | null>(null);
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => new Set());
   const [viewPath, setViewPath] = useState(normalizedRoot);
   const [viewMode, setViewMode] = useState<"tree" | "flat">(getStoredViewMode);
@@ -473,6 +491,124 @@ export default function FileList({
   const flatTotalHeight = filteredFlatFiles.length * FLAT_ROW_HEIGHT;
   const hasActiveFlatFilters =
     flatSizeFilter !== "all" || flatModifiedFilter !== "all" || normalizedFlatSearchQuery.length > 0;
+  const navigableItems = viewMode === "flat"
+    ? filteredFlatFiles.map((item) => ({
+        item,
+        hasChildren: (nodeMap.get(normalizePath(item.path))?.children.length ?? 0) > 0,
+      }))
+    : flatNodes.map(({ item, hasChildren }) => ({ item, hasChildren }));
+  const selectedIndex = navigableItems.findIndex(
+    ({ item }) => normalizePath(item.path) === normalizePath(selectedPath ?? ""),
+  );
+  const selectedNavigableItem =
+    selectedIndex >= 0 ? navigableItems[selectedIndex] : null;
+
+  const selectNavigableIndex = (index: number) => {
+    if (navigableItems.length === 0) return;
+
+    const nextItem = navigableItems[clampIndex(index, navigableItems.length - 1)];
+    setSelectedPath(nextItem.item.path);
+    setOpenMenuPath(null);
+  };
+
+  const enterDirectory = (item: FileInfo) => {
+    if (!item.is_dir) return false;
+
+    if (viewMode === "flat") {
+      setViewMode("tree");
+    }
+
+    setViewPath(item.path);
+    setExpandedPaths((current) => {
+      const next = new Set(current);
+      next.add(item.path);
+      return next;
+    });
+    setOpenMenuPath(null);
+    return true;
+  };
+
+  const handleListKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (
+      event.target !== event.currentTarget ||
+      isTextEntryTarget(event.target) ||
+      navigableItems.length === 0
+    ) {
+      return;
+    }
+
+    const current = selectedNavigableItem ?? navigableItems[0];
+    const indexForMovement = selectedIndex >= 0 ? selectedIndex : 0;
+
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      selectNavigableIndex(indexForMovement + 1);
+      return;
+    }
+
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      selectNavigableIndex(indexForMovement - 1);
+      return;
+    }
+
+    if (event.key === "Home") {
+      event.preventDefault();
+      selectNavigableIndex(0);
+      return;
+    }
+
+    if (event.key === "End") {
+      event.preventDefault();
+      selectNavigableIndex(navigableItems.length - 1);
+      return;
+    }
+
+    if (event.key === "ArrowRight" && current.hasChildren) {
+      event.preventDefault();
+      if (viewMode === "tree" && !expandedPaths.has(current.item.path)) {
+        toggleExpand(current.item.path);
+        return;
+      }
+      enterDirectory(current.item);
+      return;
+    }
+
+    if (event.key === "ArrowLeft") {
+      event.preventDefault();
+      if (viewMode === "tree" && current.hasChildren && expandedPaths.has(current.item.path)) {
+        toggleExpand(current.item.path);
+        return;
+      }
+
+      if (viewMode === "tree" && canGoUp) {
+        setViewPath(getParentPath(viewPath) ?? normalizedRoot);
+      }
+      return;
+    }
+
+    if (event.key === "Enter") {
+      event.preventDefault();
+      if (!enterDirectory(current.item)) {
+        onShowInFinder(current.item);
+      }
+      return;
+    }
+
+    if (event.key === " ") {
+      event.preventDefault();
+      setOpenMenuPath((openPath) =>
+        openPath === current.item.path ? null : current.item.path,
+      );
+      return;
+    }
+
+    if (event.key === "Delete" || event.key === "Backspace") {
+      if (isPreview) return;
+      event.preventDefault();
+      onDelete(current.item);
+    }
+  };
 
   useEffect(() => {
     if (viewMode !== "flat" || !selectedPath || !flatContainerRef.current) return;
@@ -496,6 +632,15 @@ export default function FileList({
     selectedPath,
     viewMode,
   ]);
+
+  useEffect(() => {
+    if (viewMode !== "tree" || !selectedPath || !selectedRowRef.current) return;
+
+    selectedRowRef.current.scrollIntoView({
+      block: "nearest",
+      inline: "nearest",
+    });
+  }, [selectedPath, viewMode, viewPath, expandedPaths]);
 
   useEffect(() => {
     if (viewMode !== "flat") return;
@@ -866,7 +1011,10 @@ export default function FileList({
 
           {viewMode === "tree" ? (
             <div
+              ref={treeContainerRef}
+              tabIndex={0}
               className="overflow-auto"
+              onKeyDown={handleListKeyDown}
               style={{ height: LIST_PANEL_HEIGHT, minHeight: `${LIST_PANEL_MIN_HEIGHT}px` }}
             >
               <table className="min-w-[920px] w-full table-fixed border-collapse">
@@ -901,6 +1049,9 @@ export default function FileList({
                     return (
                       <tr
                         key={item.path}
+                        ref={(node) => {
+                          if (isSelected) selectedRowRef.current = node;
+                        }}
                         className={`border-b border-gray-100 transition-colors ${
                           isSelected ? "bg-blue-50/80" : "hover:bg-gray-50"
                         }`}
@@ -935,7 +1086,10 @@ export default function FileList({
 
                             <button
                               type="button"
-                              onClick={() => setSelectedPath(item.path)}
+                              onClick={() => {
+                                setSelectedPath(item.path);
+                                treeContainerRef.current?.focus();
+                              }}
                               className="min-w-0 text-left"
                             >
                               <div className="truncate text-sm font-medium text-gray-900">
@@ -1005,7 +1159,9 @@ export default function FileList({
           ) : (
             <div
               ref={flatContainerRef}
+              tabIndex={0}
               className="overflow-auto bg-white"
+              onKeyDown={handleListKeyDown}
               style={{ height: LIST_PANEL_HEIGHT, minHeight: `${LIST_PANEL_MIN_HEIGHT}px` }}
               onScroll={(event) => setFlatScrollTop(event.currentTarget.scrollTop)}
             >
@@ -1041,6 +1197,9 @@ export default function FileList({
                       return (
                         <div
                           key={item.path}
+                          ref={(node) => {
+                            if (isSelected) selectedRowRef.current = node;
+                          }}
                           className={`grid grid-cols-[minmax(0,1.7fr)_120px_180px_170px_56px] items-center gap-4 border-b border-gray-100 px-6 py-3 transition-colors ${
                             isSelected ? "bg-blue-50/80" : "hover:bg-gray-50"
                           }`}
@@ -1048,7 +1207,10 @@ export default function FileList({
                         >
                           <button
                             type="button"
-                            onClick={() => setSelectedPath(item.path)}
+                            onClick={() => {
+                              setSelectedPath(item.path);
+                              flatContainerRef.current?.focus();
+                            }}
                             className="min-w-0 text-left"
                           >
                             <div className="flex min-w-0 items-center gap-2">

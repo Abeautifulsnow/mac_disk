@@ -2,3 +2,9 @@ node_modules
 dist
 src-tauri/target
 todo.md
+.claude
+.agents
+.opencode
+.codex
+.trellis
+.DS_Store

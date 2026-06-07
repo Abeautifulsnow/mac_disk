@@ -53,6 +53,7 @@ const LIST_PANEL_HEIGHT = "calc(100vh - 320px)";
 const LIST_PANEL_MIN_HEIGHT = 420;
 const FLAT_ROW_HEIGHT = 76;
 const FLAT_OVERSCAN = 8;
+const RESULT_VIEW_MODE_STORAGE_KEY = "mac-disk-scanner.result-view-mode";
 
 function normalizePath(path: string): string {
   if (path === "/") return "/";
@@ -176,6 +177,13 @@ function buildPathSegments(scanRoot: string, currentPath: string) {
   return segments;
 }
 
+function getStoredViewMode(): "tree" | "flat" {
+  if (typeof window === "undefined") return "tree";
+
+  const stored = window.localStorage.getItem(RESULT_VIEW_MODE_STORAGE_KEY);
+  return stored === "flat" ? "flat" : "tree";
+}
+
 export default function FileList({
   files,
   sessionKey,
@@ -198,7 +206,7 @@ export default function FileList({
   const flatContainerRef = useRef<HTMLDivElement | null>(null);
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => new Set());
   const [viewPath, setViewPath] = useState(normalizedRoot);
-  const [viewMode, setViewMode] = useState<"tree" | "flat">("tree");
+  const [viewMode, setViewMode] = useState<"tree" | "flat">(getStoredViewMode);
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [openMenuPath, setOpenMenuPath] = useState<string | null>(null);
   const [flatScrollTop, setFlatScrollTop] = useState(0);
@@ -222,6 +230,10 @@ export default function FileList({
         : files[0]?.path ?? null;
     });
   }, [files]);
+
+  useEffect(() => {
+    window.localStorage.setItem(RESULT_VIEW_MODE_STORAGE_KEY, viewMode);
+  }, [viewMode]);
 
   useEffect(() => {
     if (viewPath === normalizedRoot) return;

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Calendar,
   ChevronDown,
@@ -7,6 +7,8 @@ import {
   File,
   Folder,
   FolderOpen,
+  List,
+  ListTree,
   MoreHorizontal,
   RotateCw,
   Trash2,
@@ -45,6 +47,10 @@ interface FlatNode {
 }
 
 const MAX_BAR_WIDTH = 100;
+const LIST_PANEL_HEIGHT = "calc(100vh - 320px)";
+const LIST_PANEL_MIN_HEIGHT = 420;
+const FLAT_ROW_HEIGHT = 76;
+const FLAT_OVERSCAN = 8;
 
 function normalizePath(path: string): string {
   if (path === "/") return "/";
@@ -187,16 +193,21 @@ export default function FileList({
     [files, normalizedRoot, sizeMode],
   );
 
+  const flatContainerRef = useRef<HTMLDivElement | null>(null);
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => new Set());
   const [viewPath, setViewPath] = useState(normalizedRoot);
+  const [viewMode, setViewMode] = useState<"tree" | "flat">("tree");
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [openMenuPath, setOpenMenuPath] = useState<string | null>(null);
+  const [flatScrollTop, setFlatScrollTop] = useState(0);
+  const [flatViewportHeight, setFlatViewportHeight] = useState(LIST_PANEL_MIN_HEIGHT);
 
   useEffect(() => {
     setExpandedPaths(new Set());
     setViewPath(normalizedRoot);
     setSelectedPath(null);
     setOpenMenuPath(null);
+    setFlatScrollTop(0);
   }, [normalizedRoot, sessionKey]);
 
   useEffect(() => {
@@ -235,6 +246,20 @@ export default function FileList({
     setViewPath(getParentPath(focusedFile.path) ?? normalizedRoot);
   }, [files, focusedPath, normalizedRoot]);
 
+  useEffect(() => {
+    if (viewMode !== "flat") return;
+
+    const measure = () => {
+      const nextHeight = flatContainerRef.current?.clientHeight;
+      if (!nextHeight) return;
+      setFlatViewportHeight(nextHeight);
+    };
+
+    measure();
+    window.addEventListener("resize", measure);
+    return () => window.removeEventListener("resize", measure);
+  }, [viewMode]);
+
   const branchNodes = useMemo(() => {
     if (viewPath === normalizedRoot) {
       return roots;
@@ -247,11 +272,23 @@ export default function FileList({
     () => flattenTree(branchNodes, expandedPaths),
     [branchNodes, expandedPaths],
   );
+  const flatFiles = useMemo(
+    () => [...files].sort((a, b) => {
+      const sizeDelta = getSizeValue(b, sizeMode) - getSizeValue(a, sizeMode);
+      if (sizeDelta !== 0) return sizeDelta;
+      return a.path.localeCompare(b.path);
+    }),
+    [files, sizeMode],
+  );
 
   const totalSize = useMemo(
     () =>
       branchNodes.reduce((sum, node) => sum + getSizeValue(node.item, sizeMode), 0),
     [branchNodes, sizeMode],
+  );
+  const flatTotalSize = useMemo(
+    () => flatFiles.reduce((sum, item) => sum + getSizeValue(item, sizeMode), 0),
+    [flatFiles, sizeMode],
   );
 
   const selectedFile =
@@ -280,7 +317,113 @@ export default function FileList({
   };
 
   const canGoUp = viewPath !== normalizedRoot;
-  const currentLevelLabel = viewPath === normalizedRoot ? "根目录" : viewPath;
+  const currentLevelLabel =
+    viewMode === "flat"
+      ? "全部结果"
+      : viewPath === normalizedRoot
+        ? "根目录"
+        : viewPath;
+  const currentListSize = viewMode === "flat" ? flatTotalSize : totalSize;
+  const flatStartIndex = Math.max(
+    0,
+    Math.floor(flatScrollTop / FLAT_ROW_HEIGHT) - FLAT_OVERSCAN,
+  );
+  const flatEndIndex = Math.min(
+    flatFiles.length,
+    Math.ceil((flatScrollTop + flatViewportHeight) / FLAT_ROW_HEIGHT) + FLAT_OVERSCAN,
+  );
+  const visibleFlatFiles = flatFiles.slice(flatStartIndex, flatEndIndex);
+  const flatOffsetTop = flatStartIndex * FLAT_ROW_HEIGHT;
+  const flatTotalHeight = flatFiles.length * FLAT_ROW_HEIGHT;
+
+  useEffect(() => {
+    if (viewMode !== "flat" || !selectedPath || !flatContainerRef.current) return;
+
+    const index = flatFiles.findIndex(
+      (item) => normalizePath(item.path) === normalizePath(selectedPath),
+    );
+    if (index === -1) return;
+
+    const targetTop = index * FLAT_ROW_HEIGHT;
+    const viewportBottom = flatScrollTop + flatViewportHeight - FLAT_ROW_HEIGHT;
+    if (targetTop >= flatScrollTop && targetTop <= viewportBottom) return;
+
+    flatContainerRef.current.scrollTo({
+      top: Math.max(0, targetTop - flatViewportHeight / 2 + FLAT_ROW_HEIGHT / 2),
+    });
+  }, [flatFiles, flatScrollTop, flatViewportHeight, selectedPath, viewMode]);
+
+  const renderItemActions = (item: FileInfo, hasChildren: boolean) => (
+    <div className="relative flex justify-end">
+      <button
+        type="button"
+        onClick={() =>
+          setOpenMenuPath((current) => (current === item.path ? null : item.path))
+        }
+        className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-gray-200 text-gray-600 hover:bg-gray-50"
+        title="更多操作"
+      >
+        <MoreHorizontal className="h-4 w-4" />
+      </button>
+
+      {openMenuPath === item.path && (
+        <div className="absolute right-0 top-9 z-20 w-44 rounded-lg border border-gray-200 bg-white py-1 text-sm shadow-lg">
+          {item.is_dir && hasChildren && (
+            <button
+              type="button"
+              onClick={() => handleMenuAction(() => setViewPath(item.path))}
+              className="flex w-full items-center gap-2 px-3 py-2 text-left text-gray-700 hover:bg-gray-50"
+            >
+              <FolderOpen className="h-4 w-4 text-gray-500" />
+              进入目录
+            </button>
+          )}
+
+          <button
+            type="button"
+            onClick={() => handleMenuAction(() => onShowInFinder(item))}
+            className="flex w-full items-center gap-2 px-3 py-2 text-left text-gray-700 hover:bg-gray-50"
+          >
+            <FolderOpen className="h-4 w-4 text-gray-500" />
+            在 Finder 中显示
+          </button>
+
+          <button
+            type="button"
+            onClick={() => handleMenuAction(() => onCopyPath(item))}
+            className="flex w-full items-center gap-2 px-3 py-2 text-left text-gray-700 hover:bg-gray-50"
+          >
+            <Copy className="h-4 w-4 text-gray-500" />
+            复制路径
+          </button>
+
+          {item.is_dir && (
+            <button
+              type="button"
+              onClick={() => handleMenuAction(() => onRescanDirectory(item))}
+              disabled={isPreview}
+              className="flex w-full items-center gap-2 px-3 py-2 text-left text-gray-700 hover:bg-gray-50 disabled:cursor-not-allowed disabled:text-gray-400"
+            >
+              <RotateCw className="h-4 w-4 text-gray-500" />
+              {isPreview ? "扫描中暂不可重扫" : "重新扫描此目录"}
+            </button>
+          )}
+
+          <div className="my-1 h-px bg-gray-100" />
+
+          <button
+            type="button"
+            onClick={() => handleMenuAction(() => onDelete(item))}
+            disabled={isPreview}
+            className="flex w-full items-center gap-2 px-3 py-2 text-left text-red-600 hover:bg-red-50 disabled:cursor-not-allowed disabled:text-gray-400 disabled:hover:bg-white"
+          >
+            <Trash2 className="h-4 w-4" />
+            {isPreview ? "扫描中暂不可删除" : "移到废纸篓"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
 
   return (
     <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
@@ -311,7 +454,13 @@ export default function FileList({
           </div>
 
           <div className="text-right text-sm text-gray-500">
-            <div>{isPreview ? "预览结果会持续变化" : "树形表格支持逐层展开和查看详情"}</div>
+            <div>
+              {isPreview
+                ? "预览结果会持续变化"
+                : viewMode === "tree"
+                  ? "树形表格支持逐层展开和查看详情"
+                  : "平铺视图按体积排序，并对长列表做窗口化渲染"}
+            </div>
             <div className="mt-1 text-xs text-gray-400">
               当前层级: {currentLevelLabel}
             </div>
@@ -328,241 +477,296 @@ export default function FileList({
         <div className="border-r border-gray-200">
           <div className="flex items-center justify-between px-6 py-3 border-b border-gray-200 bg-white">
             <div className="text-sm text-gray-500">
-              当前视图合计: <span className="font-semibold text-gray-900">{formatFileSize(totalSize)}</span>
+              当前视图合计: <span className="font-semibold text-gray-900">{formatFileSize(currentListSize)}</span>
             </div>
             <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={() => setViewPath(normalizedRoot)}
-                className="px-3 py-1.5 text-xs font-medium rounded-md border border-gray-200 text-gray-700 hover:bg-gray-50"
-              >
-                回到根目录
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  if (!canGoUp) return;
-                  setViewPath(getParentPath(viewPath) ?? normalizedRoot);
-                }}
-                disabled={!canGoUp}
-                className="px-3 py-1.5 text-xs font-medium rounded-md border border-gray-200 text-gray-700 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed"
-              >
-                返回上一级
-              </button>
+              <div className="inline-flex rounded-md border border-gray-200 bg-white p-0.5">
+                <button
+                  type="button"
+                  onClick={() => setViewMode("tree")}
+                  className={`inline-flex items-center gap-1 rounded px-2.5 py-1.5 text-xs font-medium ${
+                    viewMode === "tree"
+                      ? "bg-blue-50 text-blue-700"
+                      : "text-gray-600 hover:bg-gray-50"
+                  }`}
+                >
+                  <ListTree className="h-3.5 w-3.5" />
+                  树形
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setViewMode("flat")}
+                  className={`inline-flex items-center gap-1 rounded px-2.5 py-1.5 text-xs font-medium ${
+                    viewMode === "flat"
+                      ? "bg-blue-50 text-blue-700"
+                      : "text-gray-600 hover:bg-gray-50"
+                  }`}
+                >
+                  <List className="h-3.5 w-3.5" />
+                  平铺
+                </button>
+              </div>
+              {viewMode === "tree" && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => setViewPath(normalizedRoot)}
+                    className="px-3 py-1.5 text-xs font-medium rounded-md border border-gray-200 text-gray-700 hover:bg-gray-50"
+                  >
+                    回到根目录
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!canGoUp) return;
+                      setViewPath(getParentPath(viewPath) ?? normalizedRoot);
+                    }}
+                    disabled={!canGoUp}
+                    className="px-3 py-1.5 text-xs font-medium rounded-md border border-gray-200 text-gray-700 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    返回上一级
+                  </button>
+                </>
+              )}
             </div>
           </div>
 
-          <div
-            className="overflow-auto"
-            style={{ height: "calc(100vh - 320px)", minHeight: "420px" }}
-          >
-            <table className="min-w-[920px] w-full table-fixed border-collapse">
-              <thead className="sticky top-0 z-10 bg-gray-50">
-                <tr>
-                  <th className="w-[40%] px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">
-                    名称
-                  </th>
-                  <th className="w-[12%] px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">
-                    类型
-                  </th>
-                  <th className="w-[22%] px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">
-                    大小
-                  </th>
-                  <th className="w-[18%] px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">
-                    修改时间
-                  </th>
-                  <th className="w-[8%] px-4 py-3 text-right text-xs font-medium uppercase tracking-wider text-gray-500">
-                    操作
-                  </th>
-                </tr>
-              </thead>
-              <tbody className="bg-white">
-                {flatNodes.map(({ item, depth, hasChildren }) => {
-                  const itemSize = getSizeValue(item, sizeMode);
-                  const ratio = totalSize > 0 ? Math.min((itemSize / totalSize) * MAX_BAR_WIDTH, MAX_BAR_WIDTH) : 0;
-                  const isExpanded = expandedPaths.has(item.path);
-                  const isSelected = normalizePath(selectedPath ?? "") === item.path;
+          {viewMode === "tree" ? (
+            <div
+              className="overflow-auto"
+              style={{ height: LIST_PANEL_HEIGHT, minHeight: `${LIST_PANEL_MIN_HEIGHT}px` }}
+            >
+              <table className="min-w-[920px] w-full table-fixed border-collapse">
+                <thead className="sticky top-0 z-10 bg-gray-50">
+                  <tr>
+                    <th className="w-[40%] px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">
+                      名称
+                    </th>
+                    <th className="w-[12%] px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">
+                      类型
+                    </th>
+                    <th className="w-[22%] px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">
+                      大小
+                    </th>
+                    <th className="w-[18%] px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">
+                      修改时间
+                    </th>
+                    <th className="w-[8%] px-4 py-3 text-right text-xs font-medium uppercase tracking-wider text-gray-500">
+                      操作
+                    </th>
+                  </tr>
+                </thead>
+                <tbody className="bg-white">
+                  {flatNodes.map(({ item, depth, hasChildren }) => {
+                    const itemSize = getSizeValue(item, sizeMode);
+                    const ratio = currentListSize > 0
+                      ? Math.min((itemSize / currentListSize) * MAX_BAR_WIDTH, MAX_BAR_WIDTH)
+                      : 0;
+                    const isExpanded = expandedPaths.has(item.path);
+                    const isSelected = normalizePath(selectedPath ?? "") === item.path;
 
-                  return (
-                    <tr
-                      key={item.path}
-                      className={`border-b border-gray-100 transition-colors ${
-                        isSelected ? "bg-blue-50/80" : "hover:bg-gray-50"
-                      }`}
-                    >
-                      <td className="px-6 py-3">
-                        <div
-                          className="flex min-w-0 items-center gap-2"
-                          style={{ paddingLeft: `${depth * 20}px` }}
-                        >
-                          {hasChildren ? (
+                    return (
+                      <tr
+                        key={item.path}
+                        className={`border-b border-gray-100 transition-colors ${
+                          isSelected ? "bg-blue-50/80" : "hover:bg-gray-50"
+                        }`}
+                      >
+                        <td className="px-6 py-3">
+                          <div
+                            className="flex min-w-0 items-center gap-2"
+                            style={{ paddingLeft: `${depth * 20}px` }}
+                          >
+                            {hasChildren ? (
+                              <button
+                                type="button"
+                                onClick={() => toggleExpand(item.path)}
+                                className="flex h-6 w-6 items-center justify-center rounded-md text-gray-500 hover:bg-gray-100"
+                                title={isExpanded ? "折叠目录" : "展开目录"}
+                              >
+                                {isExpanded ? (
+                                  <ChevronDown className="h-4 w-4" />
+                                ) : (
+                                  <ChevronRight className="h-4 w-4" />
+                                )}
+                              </button>
+                            ) : (
+                              <span className="block h-6 w-6" />
+                            )}
+
+                            {item.is_dir ? (
+                              <Folder className="h-4 w-4 flex-shrink-0 text-blue-500" />
+                            ) : (
+                              <File className="h-4 w-4 flex-shrink-0 text-gray-500" />
+                            )}
+
                             <button
                               type="button"
-                              onClick={() => toggleExpand(item.path)}
-                              className="flex h-6 w-6 items-center justify-center rounded-md text-gray-500 hover:bg-gray-100"
-                              title={isExpanded ? "折叠目录" : "展开目录"}
+                              onClick={() => setSelectedPath(item.path)}
+                              className="min-w-0 text-left"
                             >
-                              {isExpanded ? (
-                                <ChevronDown className="h-4 w-4" />
-                              ) : (
-                                <ChevronRight className="h-4 w-4" />
-                              )}
+                              <div className="truncate text-sm font-medium text-gray-900">
+                                {item.name}
+                              </div>
+                              <div className="truncate text-xs text-gray-500">{item.path}</div>
                             </button>
-                          ) : (
-                            <span className="block h-6 w-6" />
-                          )}
+                          </div>
+                        </td>
 
-                          {item.is_dir ? (
-                            <Folder className="h-4 w-4 flex-shrink-0 text-blue-500" />
-                          ) : (
-                            <File className="h-4 w-4 flex-shrink-0 text-gray-500" />
-                          )}
+                        <td className="px-4 py-3 align-middle">
+                          <span
+                            className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${
+                              item.is_dir
+                                ? "bg-blue-100 text-blue-700"
+                                : "bg-gray-100 text-gray-700"
+                            }`}
+                          >
+                            {item.is_dir ? "目录" : "文件"}
+                          </span>
+                        </td>
 
+                        <td className="px-4 py-3 align-middle">
+                          <div className="space-y-1.5">
+                            <div className="text-sm font-semibold text-gray-900">
+                              {formatFileSize(itemSize)}
+                            </div>
+                            <div className="h-2 rounded-full bg-gray-100">
+                              <div
+                                className="h-2 rounded-full bg-blue-500 transition-[width] duration-300"
+                                style={{ width: `${ratio}%` }}
+                              />
+                            </div>
+                            <div className="text-xs text-gray-500">
+                              占当前视图 {currentListSize > 0 ? ((itemSize / currentListSize) * 100).toFixed(1) : "0.0"}%
+                            </div>
+                          </div>
+                        </td>
+
+                        <td className="px-4 py-3 align-middle text-sm text-gray-500">
+                          <div className="flex items-center gap-2 whitespace-nowrap">
+                            <Calendar className="h-4 w-4 text-gray-400" />
+                            {formatDate(item.modified)}
+                          </div>
+                        </td>
+
+                        <td className="px-4 py-3 align-middle">
+                          {renderItemActions(item, hasChildren)}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+
+              {flatNodes.length === 0 && (
+                <div className="flex h-full min-h-[360px] items-center justify-center px-8">
+                  <div className="text-center">
+                    <div className="text-sm font-medium text-gray-900">当前层级没有可展示项</div>
+                    <div className="mt-1 text-sm text-gray-500">
+                      返回上一级，或降低最小大小限制后重新扫描
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          ) : (
+            <div
+              ref={flatContainerRef}
+              className="overflow-auto bg-white"
+              style={{ height: LIST_PANEL_HEIGHT, minHeight: `${LIST_PANEL_MIN_HEIGHT}px` }}
+              onScroll={(event) => setFlatScrollTop(event.currentTarget.scrollTop)}
+            >
+              {flatFiles.length === 0 ? (
+                <div className="flex h-full min-h-[360px] items-center justify-center px-8">
+                  <div className="text-center">
+                    <div className="text-sm font-medium text-gray-900">当前没有可展示项</div>
+                    <div className="mt-1 text-sm text-gray-500">
+                      调整筛选条件，或重新扫描后再查看
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div style={{ height: `${flatTotalHeight}px`, position: "relative" }}>
+                  <div
+                    style={{
+                      transform: `translateY(${flatOffsetTop}px)`,
+                    }}
+                  >
+                    {visibleFlatFiles.map((item) => {
+                      const itemSize = getSizeValue(item, sizeMode);
+                      const ratio = currentListSize > 0
+                        ? Math.min((itemSize / currentListSize) * MAX_BAR_WIDTH, MAX_BAR_WIDTH)
+                        : 0;
+                      const isSelected =
+                        normalizePath(selectedPath ?? "") === normalizePath(item.path);
+                      const hasChildren = (nodeMap.get(normalizePath(item.path))?.children.length ?? 0) > 0;
+
+                      return (
+                        <div
+                          key={item.path}
+                          className={`grid grid-cols-[minmax(0,1.7fr)_120px_180px_170px_56px] items-center gap-4 border-b border-gray-100 px-6 py-3 transition-colors ${
+                            isSelected ? "bg-blue-50/80" : "hover:bg-gray-50"
+                          }`}
+                          style={{ height: `${FLAT_ROW_HEIGHT}px` }}
+                        >
                           <button
                             type="button"
                             onClick={() => setSelectedPath(item.path)}
                             className="min-w-0 text-left"
                           >
-                            <div className="truncate text-sm font-medium text-gray-900">
-                              {item.name}
+                            <div className="flex min-w-0 items-center gap-2">
+                              {item.is_dir ? (
+                                <Folder className="h-4 w-4 flex-shrink-0 text-blue-500" />
+                              ) : (
+                                <File className="h-4 w-4 flex-shrink-0 text-gray-500" />
+                              )}
+                              <div className="min-w-0">
+                                <div className="truncate text-sm font-medium text-gray-900">
+                                  {item.name}
+                                </div>
+                                <div className="truncate text-xs text-gray-500">{item.path}</div>
+                              </div>
                             </div>
-                            <div className="truncate text-xs text-gray-500">{item.path}</div>
-                          </button>
-                        </div>
-                      </td>
-
-                      <td className="px-4 py-3 align-middle">
-                        <span
-                          className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${
-                            item.is_dir
-                              ? "bg-blue-100 text-blue-700"
-                              : "bg-gray-100 text-gray-700"
-                          }`}
-                        >
-                          {item.is_dir ? "目录" : "文件"}
-                        </span>
-                      </td>
-
-                      <td className="px-4 py-3 align-middle">
-                        <div className="space-y-1.5">
-                          <div className="text-sm font-semibold text-gray-900">
-                            {formatFileSize(itemSize)}
-                          </div>
-                          <div className="h-2 rounded-full bg-gray-100">
-                            <div
-                              className="h-2 rounded-full bg-blue-500 transition-[width] duration-300"
-                              style={{ width: `${ratio}%` }}
-                            />
-                          </div>
-                          <div className="text-xs text-gray-500">
-                            占当前视图 {totalSize > 0 ? ((itemSize / totalSize) * 100).toFixed(1) : "0.0"}%
-                          </div>
-                        </div>
-                      </td>
-
-                      <td className="px-4 py-3 align-middle text-sm text-gray-500">
-                        <div className="flex items-center gap-2 whitespace-nowrap">
-                          <Calendar className="h-4 w-4 text-gray-400" />
-                          {formatDate(item.modified)}
-                        </div>
-                      </td>
-
-                      <td className="px-4 py-3 align-middle">
-                        <div className="relative flex justify-end">
-                          <button
-                            type="button"
-                            onClick={() =>
-                              setOpenMenuPath((current) =>
-                                current === item.path ? null : item.path,
-                              )
-                            }
-                            className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-gray-200 text-gray-600 hover:bg-gray-50"
-                            title="更多操作"
-                          >
-                            <MoreHorizontal className="h-4 w-4" />
                           </button>
 
-                          {openMenuPath === item.path && (
-                            <div className="absolute right-0 top-9 z-20 w-44 rounded-lg border border-gray-200 bg-white py-1 text-sm shadow-lg">
-                              {item.is_dir && hasChildren && (
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    handleMenuAction(() => setViewPath(item.path))
-                                  }
-                                  className="flex w-full items-center gap-2 px-3 py-2 text-left text-gray-700 hover:bg-gray-50"
-                                >
-                                  <FolderOpen className="h-4 w-4 text-gray-500" />
-                                  进入目录
-                                </button>
-                              )}
+                          <div>
+                            <span
+                              className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${
+                                item.is_dir
+                                  ? "bg-blue-100 text-blue-700"
+                                  : "bg-gray-100 text-gray-700"
+                              }`}
+                            >
+                              {item.is_dir ? "目录" : "文件"}
+                            </span>
+                          </div>
 
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  handleMenuAction(() => onShowInFinder(item))
-                                }
-                                className="flex w-full items-center gap-2 px-3 py-2 text-left text-gray-700 hover:bg-gray-50"
-                              >
-                                <FolderOpen className="h-4 w-4 text-gray-500" />
-                                在 Finder 中显示
-                              </button>
-
-                              <button
-                                type="button"
-                                onClick={() => handleMenuAction(() => onCopyPath(item))}
-                                className="flex w-full items-center gap-2 px-3 py-2 text-left text-gray-700 hover:bg-gray-50"
-                              >
-                                <Copy className="h-4 w-4 text-gray-500" />
-                                复制路径
-                              </button>
-
-                              {item.is_dir && (
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    handleMenuAction(() => onRescanDirectory(item))
-                                  }
-                                  disabled={isPreview}
-                                  className="flex w-full items-center gap-2 px-3 py-2 text-left text-gray-700 hover:bg-gray-50 disabled:cursor-not-allowed disabled:text-gray-400"
-                                >
-                                  <RotateCw className="h-4 w-4 text-gray-500" />
-                                  {isPreview ? "扫描中暂不可重扫" : "重新扫描此目录"}
-                                </button>
-                              )}
-
-                              <div className="my-1 h-px bg-gray-100" />
-
-                              <button
-                                type="button"
-                                onClick={() => handleMenuAction(() => onDelete(item))}
-                                disabled={isPreview}
-                                className="flex w-full items-center gap-2 px-3 py-2 text-left text-red-600 hover:bg-red-50 disabled:cursor-not-allowed disabled:text-gray-400 disabled:hover:bg-white"
-                              >
-                                <Trash2 className="h-4 w-4" />
-                                {isPreview ? "扫描中暂不可删除" : "移到废纸篓"}
-                              </button>
+                          <div className="space-y-1.5">
+                            <div className="text-sm font-semibold text-gray-900">
+                              {formatFileSize(itemSize)}
                             </div>
-                          )}
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+                            <div className="h-2 rounded-full bg-gray-100">
+                              <div
+                                className="h-2 rounded-full bg-blue-500 transition-[width] duration-300"
+                                style={{ width: `${ratio}%` }}
+                              />
+                            </div>
+                          </div>
 
-            {flatNodes.length === 0 && (
-              <div className="flex h-full min-h-[360px] items-center justify-center px-8">
-                <div className="text-center">
-                  <div className="text-sm font-medium text-gray-900">当前层级没有可展示项</div>
-                  <div className="mt-1 text-sm text-gray-500">
-                    返回上一级，或降低最小大小限制后重新扫描
+                          <div className="flex items-center gap-2 text-sm text-gray-500">
+                            <Calendar className="h-4 w-4 text-gray-400" />
+                            {formatDate(item.modified)}
+                          </div>
+
+                          {renderItemActions(item, hasChildren)}
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
-              </div>
-            )}
-          </div>
+              )}
+            </div>
+          )}
         </div>
 
         <aside className="bg-gray-50/70">

@@ -154,6 +154,54 @@ impl ScanManager {
 pub struct DeleteResult {
     pub message: String,
     pub updated: Option<index::IndexSummary>,
+    pub succeeded_paths: Vec<String>,
+    pub failed_paths: Vec<String>,
+}
+
+#[derive(Debug)]
+struct BatchTrashResult {
+    successes: Vec<PathBuf>,
+    failures: Vec<String>,
+}
+
+fn normalize_batch_paths(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths.sort_by_key(|path| path.components().count());
+    let mut normalized = Vec::with_capacity(paths.len());
+    for path in paths {
+        if normalized.iter().any(|ancestor| path.starts_with(ancestor)) {
+            continue;
+        }
+        normalized.push(path);
+    }
+    normalized
+}
+
+/// Run the Finder AppleScript that moves one path to the Trash.
+fn trash_with_finder(path_buf: &std::path::Path) -> Result<(), String> {
+    let script = r#"
+on run argv
+  tell application "Finder"
+    delete POSIX file (item 1 of argv)
+  end tell
+end run
+"#;
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .arg(path_buf.to_string_lossy().to_string())
+        .output()
+        .map_err(|e| format!("无法调用 Finder: {}", e))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(if stderr.is_empty() {
+            "移到废纸篓失败".to_string()
+        } else {
+            format!("移到废纸篓失败: {}", stderr)
+        })
+    }
 }
 
 #[command]
@@ -178,34 +226,9 @@ pub async fn delete_path(
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| path.clone());
 
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        let script = r#"
-on run argv
-  tell application "Finder"
-    delete POSIX file (item 1 of argv)
-  end tell
-end run
-"#;
-        let output = Command::new("osascript")
-            .arg("-e")
-            .arg(script)
-            .arg(path_buf.to_string_lossy().to_string())
-            .output()
-            .map_err(|e| format!("无法调用 Finder: {}", e))?;
-
-        if output.status.success() {
-            Ok(())
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            Err(if stderr.is_empty() {
-                "移到废纸篓失败".to_string()
-            } else {
-                format!("移到废纸篓失败: {}", stderr)
-            })
-        }
-    })
-    .await
-    .map_err(|e| format!("移到废纸篓任务执行失败: {}", e))?;
+    let result = tauri::async_runtime::spawn_blocking(move || trash_with_finder(&path_buf))
+        .await
+        .map_err(|e| format!("移到废纸篓任务执行失败: {}", e))?;
 
     match result {
         Ok(()) => {
@@ -221,10 +244,88 @@ end run
                     idx.delete_subtree(&path).map(|_| idx.summary())
                 });
 
-            Ok(DeleteResult { message, updated })
+            Ok(DeleteResult {
+                message,
+                updated,
+                succeeded_paths: vec![path],
+                failed_paths: Vec::new(),
+            })
         }
         Err(e) => Err(e),
     }
+}
+
+/// 批量把多个路径移到废纸篓（treemap 多选删除）。
+/// 成功进废纸篓的项从索引移除，失败的项保留在索引并上报。
+#[command]
+pub async fn delete_paths(
+    index_manager: State<'_, ScanIndexManager>,
+    paths: Vec<String>,
+    scan_id: Option<String>,
+) -> Result<DeleteResult, String> {
+    if paths.is_empty() {
+        return Err("没有选择要删除的项目".to_string());
+    }
+
+    // 逐路径预校验：任一敏感路径 → 整体拒绝。
+    let mut path_bufs: Vec<PathBuf> = Vec::with_capacity(paths.len());
+    for p in &paths {
+        let buf = PathBuf::from(p);
+        if !buf.exists() {
+            return Err(format!("路径不存在: {}", p));
+        }
+        if is_sensitive_path(&buf) {
+            return Err(format!("不允许删除系统关键路径: {}", p));
+        }
+        path_bufs.push(buf);
+    }
+
+    // A selected directory already covers every selected descendant. Removing
+    // those descendants also prevents a second Finder deletion from failing
+    // after its parent has entered the Trash.
+    let normalized_paths = normalize_batch_paths(path_bufs);
+
+    let trashed = tauri::async_runtime::spawn_blocking(move || {
+        let mut successes = Vec::new();
+        let mut failures = Vec::new();
+        for buf in &normalized_paths {
+            match trash_with_finder(buf) {
+                Ok(()) => successes.push(buf.clone()),
+                Err(e) => failures.push(format!("{}（路径: {}）", e, buf.display())),
+            }
+        }
+        BatchTrashResult { successes, failures }
+    })
+    .await
+    .map_err(|e| format!("批量移到废纸篓任务失败: {}", e))?;
+
+    let succeeded_paths: Vec<String> = trashed
+        .successes
+        .iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect();
+    let updated = scan_id
+        .as_deref()
+        .and_then(|sid| index_manager.get(sid))
+        .and_then(|shared| {
+            let mut idx = shared.write().unwrap();
+            (idx.delete_subtrees(&succeeded_paths) > 0).then(|| idx.summary())
+        });
+    let message = if trashed.failures.is_empty() {
+        format!("已将 {} 个项目移到废纸篓（清空废纸篓后不可恢复）", succeeded_paths.len())
+    } else {
+        format!(
+            "已将 {} 个项目移到废纸篓；{} 个项目失败",
+            succeeded_paths.len(),
+            trashed.failures.len()
+        )
+    };
+    Ok(DeleteResult {
+        message,
+        updated,
+        succeeded_paths,
+        failed_paths: trashed.failures,
+    })
 }
 
 /// 在 Finder 中显示文件或目录
@@ -817,6 +918,34 @@ mod command_tests {
         ))
         .unwrap_err();
         assert!(err.contains("IndexNotFound"), "got: {err}");
+    }
+
+    #[test]
+    fn delete_paths_rejects_empty_and_sensitive_without_trashing() {
+        let app = tauri::test::mock_builder()
+            .manage(ScanIndexManager::new())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+
+        let empty = block(delete_paths(app.state(), vec![], None)).unwrap_err();
+        assert!(empty.contains("没有选择"), "got: {empty}");
+
+        let sensitive = block(delete_paths(app.state(), vec!["/System".to_string()], None)).unwrap_err();
+        assert!(sensitive.contains("系统关键路径"), "got: {sensitive}");
+    }
+
+    #[test]
+    fn normalize_batch_paths_deduplicates_and_removes_descendants() {
+        let paths = normalize_batch_paths(vec![
+            PathBuf::from("/tmp/scan/parent/child"),
+            PathBuf::from("/tmp/scan/other"),
+            PathBuf::from("/tmp/scan/parent"),
+            PathBuf::from("/tmp/scan/other"),
+        ]);
+        assert_eq!(
+            paths,
+            vec![PathBuf::from("/tmp/scan/other"), PathBuf::from("/tmp/scan/parent")]
+        );
     }
 
     #[test]

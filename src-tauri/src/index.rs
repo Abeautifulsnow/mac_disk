@@ -663,6 +663,48 @@ impl ScanIndex {
 
         Some((removed_logical, removed_disk, removed_count))
     }
+
+    /// Remove several subtrees and rebuild derived values once after all paths
+    /// have been marked. Callers should pass de-duplicated, non-overlapping
+    /// paths; deleted or missing paths are ignored.
+    pub fn delete_subtrees(&mut self, paths: &[String]) -> usize {
+        let mut stack = Vec::new();
+        for path in paths {
+            let key = normalize_path(path);
+            let Some(&id) = self.path_to_node.get(&key) else {
+                continue;
+            };
+            if !self.nodes[id as usize].deleted {
+                stack.push(id as usize);
+            }
+        }
+
+        let mut removed_count = 0usize;
+        while let Some(node_id) = stack.pop() {
+            if self.nodes[node_id].deleted {
+                continue;
+            }
+            self.nodes[node_id].deleted = true;
+            removed_count += 1;
+            let mut child = self.nodes[node_id].first_child;
+            while child >= 0 {
+                stack.push(child as usize);
+                child = self.nodes[child as usize].next_sibling;
+            }
+        }
+
+        if removed_count > 0 {
+            self.file_ids.retain(|&id| !self.nodes[id as usize].deleted);
+            self.dir_ids.retain(|&id| !self.nodes[id as usize].deleted);
+            self.files_scanned = self.file_ids.len();
+            self.directories_scanned = self.dir_ids.len();
+            self.recompute_aggregates();
+            self.recompute_physical_unique_total();
+            self.insights = self.compute_insights();
+        }
+
+        removed_count
+    }
 }
 
 fn is_larger(candidate: &InsightPick, current: Option<&InsightPick>) -> bool {

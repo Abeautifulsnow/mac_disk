@@ -16,6 +16,7 @@ pub fn run() {
             commands::scan_directory_with_progress,
             commands::cancel_scan,
             commands::delete_path,
+            commands::delete_paths,
             commands::show_in_finder,
             commands::query_flat_files,
             commands::query_subtree,

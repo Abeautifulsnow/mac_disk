@@ -130,4 +130,6 @@ export interface DirSize {
 export interface DeleteResult {
   message: string;
   updated: IndexSummary | null;
+  succeededPaths: string[];
+  failedPaths: string[];
 }

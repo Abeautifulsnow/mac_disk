@@ -494,6 +494,27 @@ mod tests {
     }
 
     #[test]
+    fn batch_delete_subtrees_keeps_index_consistent() {
+        let dir = TestDir::new("batch_delete");
+        dir.write_file("a.bin", 10);
+        dir.write_file("keep.bin", 50);
+        dir.write_file("gone/x.bin", 30);
+        dir.write_file("gone/deep/y.bin", 20);
+        let mut index = scan(&dir.path);
+
+        let deleted = index.delete_subtrees(&[
+            dir.path.join("gone").to_string_lossy().to_string(),
+            dir.path.join("a.bin").to_string_lossy().to_string(),
+        ]);
+        assert_eq!(deleted, 5); // gone, deep, x.bin, y.bin, and a.bin
+
+        let summary = index.summary();
+        assert_eq!(summary.total_size_logical, 50);
+        assert_eq!(summary.files_scanned, 1);
+        assert!(index.query_dir_size(&dir.path.join("gone").to_string_lossy()).is_none());
+    }
+
+    #[test]
     fn pagination_is_stable_for_equal_sized_files() {
         let dir = TestDir::new("stable_page");
         for i in 0..30 {

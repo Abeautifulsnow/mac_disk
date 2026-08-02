@@ -6,24 +6,36 @@ interface ConfirmDialogProps {
   onClose: () => void
   onConfirm: () => void
   file: FileInfo | null
+  batchFiles?: FileInfo[] | null
   formatFileSize: (bytes: number) => string
   sizeMode: "logical" | "disk"
 }
+
+const MAX_BATCH_PREVIEW = 8
 
 export default function ConfirmDialog({
   isOpen,
   onClose,
   onConfirm,
   file,
+  batchFiles,
   formatFileSize,
   sizeMode
 }: ConfirmDialogProps) {
-  if (!isOpen || !file) return null
+  const hasBatch = !!batchFiles && batchFiles.length > 0
+  if (!isOpen || (!file && !hasBatch)) return null
 
   const handleConfirm = async () => {
     await onConfirm()
     onClose()
   }
+
+  const sizeOf = (f: FileInfo) => (sizeMode === "disk" ? f.sizeDisk : f.sizeLogical)
+
+  const batchTotal = hasBatch
+    ? batchFiles!.reduce((s, f) => s + sizeOf(f), 0)
+    : 0
+  const previewFiles = hasBatch ? batchFiles!.slice(0, MAX_BATCH_PREVIEW) : []
 
   return (
     <div className="fixed inset-0 z-50 overflow-y-auto">
@@ -41,7 +53,7 @@ export default function ConfirmDialog({
               </div>
               <div className="mt-3 text-center sm:mt-0 sm:ml-4 sm:text-left">
                 <h3 className="text-lg font-medium leading-6 text-gray-900">
-                  移到废纸篓
+                  {hasBatch ? `移到废纸篓（${batchFiles!.length} 项）` : "移到废纸篓"}
                 </h3>
                 <div className="mt-2">
                   <p className="text-sm text-gray-500">
@@ -49,30 +61,61 @@ export default function ConfirmDialog({
                   </p>
 
                   <div className="mt-4 rounded-lg bg-gray-50 p-4">
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <div className="text-sm font-medium text-gray-900">
-                          {file.name}
+                    {hasBatch ? (
+                      <>
+                        <div className="space-y-1.5">
+                          {previewFiles.map((f) => (
+                            <div key={f.path} className="flex items-center justify-between gap-3">
+                              <div className="min-w-0">
+                                <div className="truncate text-sm font-medium text-gray-900">{f.name}</div>
+                                <div className="truncate text-xs text-gray-500">{f.path}</div>
+                              </div>
+                              <div className="flex-shrink-0 text-sm font-semibold text-red-600">
+                                {formatFileSize(sizeOf(f))}
+                              </div>
+                            </div>
+                          ))}
+                          {batchFiles!.length > MAX_BATCH_PREVIEW && (
+                            <div className="text-xs text-gray-500">
+                              …以及另外 {batchFiles!.length - MAX_BATCH_PREVIEW} 个项目
+                            </div>
+                          )}
                         </div>
-                        <div className="text-xs text-gray-500 mt-1 truncate max-w-xs">
-                          {file.path}
+                        <div className="mt-3 flex items-center justify-between border-t border-gray-200 pt-2">
+                          <span className="text-sm text-gray-700">合计</span>
+                          <span className="text-base font-bold text-red-600">
+                            {formatFileSize(batchTotal)}
+                          </span>
                         </div>
-                      </div>
-                      <div className="text-sm font-semibold text-red-600">
-                        {formatFileSize(sizeMode === "disk" ? file.sizeDisk : file.sizeLogical)}
-                      </div>
-                    </div>
-                    <div className="mt-3 flex items-center space-x-2">
-                      <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${file.is_dir ? 'bg-blue-100 text-blue-800' : 'bg-gray-100 text-gray-800'}`}>
-                        {file.is_dir ? '目录' : '文件'}
-                      </span>
-                      {file.is_dir && (
-                        <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-amber-100 text-amber-800">
-                          <AlertTriangle className="h-3 w-3 mr-1" />
-                          包含子内容
-                        </span>
-                      )}
-                    </div>
+                      </>
+                    ) : (
+                      <>
+                        <div className="flex items-center justify-between">
+                          <div>
+                            <div className="text-sm font-medium text-gray-900">
+                              {file!.name}
+                            </div>
+                            <div className="text-xs text-gray-500 mt-1 truncate max-w-xs">
+                              {file!.path}
+                            </div>
+                          </div>
+                          <div className="text-sm font-semibold text-red-600">
+                            {formatFileSize(sizeOf(file!))}
+                          </div>
+                        </div>
+                        <div className="mt-3 flex items-center space-x-2">
+                          <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${file!.is_dir ? 'bg-blue-100 text-blue-800' : 'bg-gray-100 text-gray-800'}`}>
+                            {file!.is_dir ? '目录' : '文件'}
+                          </span>
+                          {file!.is_dir && (
+                            <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-amber-100 text-amber-800">
+                              <AlertTriangle className="h-3 w-3 mr-1" />
+                              包含子内容
+                            </span>
+                          )}
+                        </div>
+                      </>
+                    )}
                   </div>
 
                   <div className="mt-4 rounded-lg bg-red-50 p-3">
@@ -81,10 +124,11 @@ export default function ConfirmDialog({
                       <div className="ml-3">
                         <h4 className="text-sm font-medium text-red-800">注意</h4>
                         <div className="mt-1 text-sm text-red-700">
-                          {file.is_dir ? (
-                            <p>目录及其中的所有文件和子目录会一起移到废纸篓。</p>
-                          ) : (
-                            <p>项目会进入废纸篓，可在 Finder 中恢复或清倒。</p>
+                          <p>
+                            项目会进入废纸篓，可在 Finder 中恢复；<b>清空废纸篓后不可恢复</b>。
+                          </p>
+                          {hasBatch && batchFiles!.some((f) => f.is_dir) && (
+                            <p className="mt-1">目录及其中的所有内容会一起移入废纸篓。</p>
                           )}
                         </div>
                       </div>

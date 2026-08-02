@@ -8,7 +8,7 @@ import {
   XCircle,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { deletePath } from "./scanApi";
+import { deletePath, deletePaths } from "./scanApi";
 import ConfirmDialog from "./components/ConfirmDialog";
 import FileList from "./components/FileList";
 import ScanInsights from "./components/ScanInsights";
@@ -29,6 +29,7 @@ function App() {
   const [success, setSuccess] = useState<string | null>(null);
   const [cancelPending, setCancelPending] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<FileInfo | null>(null);
+  const [confirmDeleteBatch, setConfirmDeleteBatch] = useState<FileInfo[] | null>(null);
   const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null);
   const [scanStats, setScanStats] = useState<{
     filesFound: number;
@@ -279,6 +280,39 @@ function App() {
     setConfirmDelete(file);
   };
 
+  const handleDeletePaths = (files: FileInfo[]) => {
+    setConfirmDeleteBatch(files);
+  };
+
+  const confirmDeleteBatchAction = async () => {
+    if (!confirmDeleteBatch || confirmDeleteBatch.length === 0) return;
+    const paths = confirmDeleteBatch.map((f) => f.path);
+    try {
+      const result = await deletePaths(paths, scanId);
+      setSuccess(result.message);
+      if (result.failedPaths.length > 0) {
+        setError(`以下项目未能移入废纸篓：${result.failedPaths.join("；")}`);
+      }
+      setTimeout(() => setSuccess(null), 3000);
+      if (result.updated) {
+        setScanStats({
+          filesFound: result.updated.filesScanned,
+          directoriesFound: result.updated.directoriesScanned,
+          totalSizeLogical: result.updated.totalSizeLogical,
+          totalSizeDisk: result.updated.totalSizeDisk,
+          physicalUniqueTotal: result.updated.physicalUniqueTotal,
+        });
+        setInsights(result.updated.insights);
+      }
+      setListVersion((current) => current + 1);
+      setConfirmDeleteBatch(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "批量删除失败");
+      console.error("批量删除错误:", err);
+      setConfirmDeleteBatch(null);
+    }
+  };
+
   const confirmDeleteAction = async () => {
     if (!confirmDelete) return;
     const path = confirmDelete.path;
@@ -489,6 +523,7 @@ function App() {
                 onCopyPath={handleCopyPath}
                 onRescanDirectory={handleRescanDirectory}
                 onRescanRoot={handleRescanRoot}
+                onDeletePaths={handleDeletePaths}
                 formatFileSize={formatFileSize}
                 focusedPath={focusedResultPath}
                 listVersion={listVersion}
@@ -499,10 +534,18 @@ function App() {
       </main>
 
       <ConfirmDialog
-        isOpen={!!confirmDelete}
-        onClose={() => setConfirmDelete(null)}
-        onConfirm={confirmDeleteAction}
+        isOpen={!!confirmDelete || !!confirmDeleteBatch}
+        onClose={() => {
+          setConfirmDelete(null);
+          setConfirmDeleteBatch(null);
+        }}
+        onConfirm={
+          confirmDeleteBatch && confirmDeleteBatch.length > 0
+            ? confirmDeleteBatchAction
+            : confirmDeleteAction
+        }
         file={confirmDelete}
+        batchFiles={confirmDeleteBatch}
         formatFileSize={formatFileSize}
         sizeMode={sizeMode}
       />

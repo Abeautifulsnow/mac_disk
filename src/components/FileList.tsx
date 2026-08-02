@@ -10,6 +10,7 @@ import {
   List,
   ListTree,
   Loader2,
+  MapIcon,
   MoreHorizontal,
   RotateCw,
   Search,
@@ -20,6 +21,7 @@ import {
 import { queryFlatFiles, querySubtree } from "../scanApi";
 import { getSizeValue } from "../scanInsights";
 import type { FileInfo, FlatModifiedWindow, FlatSortMode } from "../types";
+import TreemapView from "./TreemapView";
 
 interface FileListProps {
   scanId: string | null;
@@ -34,6 +36,7 @@ interface FileListProps {
   onCopyPath: (file: FileInfo) => void;
   onRescanDirectory: (file: FileInfo) => void;
   onRescanRoot: () => void;
+  onDeletePaths: (files: FileInfo[]) => void;
   formatFileSize: (bytes: number) => string;
   focusedPath?: string | null;
   listVersion: number;
@@ -107,11 +110,11 @@ function buildPathSegments(scanRoot: string, currentPath: string) {
   return segments;
 }
 
-function getStoredViewMode(): "tree" | "flat" {
+function getStoredViewMode(): "tree" | "flat" | "map" {
   if (typeof window === "undefined") return "tree";
-  return window.localStorage.getItem(RESULT_VIEW_MODE_STORAGE_KEY) === "flat"
-    ? "flat"
-    : "tree";
+  const stored = window.localStorage.getItem(RESULT_VIEW_MODE_STORAGE_KEY);
+  if (stored === "flat" || stored === "map") return stored;
+  return "tree";
 }
 
 function getStoredFlatSortMode(): FlatSortMode {
@@ -178,16 +181,18 @@ export default function FileList({
   onCopyPath,
   onRescanDirectory,
   onRescanRoot,
+  onDeletePaths,
   formatFileSize,
   focusedPath,
   listVersion,
 }: FileListProps) {
   const normalizedRoot = useMemo(() => normalizePath(scanRoot), [scanRoot]);
 
-  const [viewMode, setViewMode] = useState<"tree" | "flat">(getStoredViewMode);
+  const [viewMode, setViewMode] = useState<"tree" | "flat" | "map">(getStoredViewMode);
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [openMenuPath, setOpenMenuPath] = useState<string | null>(null);
   const [indexStale, setIndexStale] = useState(false);
+  const [selectedFiles, setSelectedFiles] = useState<Map<string, FileInfo>>(new Map());
 
   // Tree state (query-driven).
   const [viewPath, setViewPath] = useState(normalizedRoot);
@@ -244,6 +249,7 @@ export default function FileList({
     setFlatTotal(0);
     setFlatHasMore(false);
     setIndexStale(false);
+    setSelectedFiles(new Map());
   }, [scanId, normalizedRoot, listVersion]);
 
   // Load the current tree directory's children.
@@ -395,6 +401,28 @@ export default function FileList({
       null
     );
   }, [selectedPath, flatItems, treeRows]);
+
+  const toggleSelect = useCallback((file: FileInfo) => {
+    setSelectedFiles((prev) => {
+      const next = new Map(prev);
+      if (next.has(file.path)) next.delete(file.path);
+      else next.set(file.path, file);
+      return next;
+    });
+  }, []);
+  const selectOnly = useCallback((file: FileInfo) => {
+    setSelectedFiles(new Map([[file.path, file]]));
+  }, []);
+  const clearSelection = useCallback(() => setSelectedFiles(new Map()), []);
+  const drillIntoMap = useCallback((path: string) => {
+    clearSelection();
+    setViewPath(path);
+  }, [clearSelection]);
+  const selectedPaths = useMemo(() => new Set(selectedFiles.keys()), [selectedFiles]);
+  const selectedTotal = useMemo(
+    () => Array.from(selectedFiles.values()).reduce((s, f) => s + getSizeValue(f, sizeMode), 0),
+    [selectedFiles, sizeMode],
+  );
 
   const previewSorted = useMemo(
     () =>
@@ -773,6 +801,33 @@ export default function FileList({
   // ---- preview state: read-only flat list from streaming events ----
 
   if (isPreview) {
+    if (viewMode === "map") {
+      return (
+        <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+          <div className="px-6 py-4 border-b border-gray-200 bg-gray-50">
+            <h2 className="text-lg font-semibold text-gray-900">扫描中地图预览</h2>
+            <p className="mt-1 text-sm text-gray-500">
+              已发现的大文件实时地图，完成后切换为精确结果。
+            </p>
+          </div>
+          <div style={{ height: "60vh", minHeight: "360px" }}>
+            <TreemapView
+              scanId={null}
+              viewPath={viewPath}
+              sizeMode={sizeMode}
+              formatFileSize={formatFileSize}
+              isPreview
+              previewItems={previewSorted}
+              selectedPaths={selectedPaths}
+              onSelect={selectOnly}
+              onToggleSelect={toggleSelect}
+              onDrill={drillIntoMap}
+              onQueryError={() => setIndexStale(true)}
+            />
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
         <div className="px-6 py-4 border-b border-gray-200 bg-gray-50">
@@ -896,6 +951,31 @@ export default function FileList({
             </button>
           </div>
         )}
+        {viewMode === "map" && selectedFiles.size > 0 && (
+          <div className="mt-3 flex items-center justify-between rounded-lg border border-blue-200 bg-blue-50 px-4 py-3">
+            <div className="flex items-center gap-2 text-sm text-blue-800">
+              已选 <span className="font-semibold">{selectedFiles.size}</span> 项 ·{" "}
+              <span className="font-semibold">{formatFileSize(selectedTotal)}</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={clearSelection}
+                className="rounded-md border border-blue-200 bg-white px-3 py-1.5 text-xs font-medium text-blue-700 hover:bg-blue-100"
+              >
+                清除选择
+              </button>
+              <button
+                type="button"
+                onClick={() => onDeletePaths(Array.from(selectedFiles.values()))}
+                className="inline-flex items-center gap-1 rounded-md border border-red-200 bg-red-50 px-3 py-1.5 text-xs font-medium text-red-700 hover:bg-red-100"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+                移到废纸篓
+              </button>
+            </div>
+          </div>
+        )}
       </div>
 
       <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_320px]">
@@ -929,6 +1009,16 @@ export default function FileList({
                 >
                   <List className="h-3.5 w-3.5" />
                   平铺
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setViewMode("map")}
+                  className={`inline-flex items-center gap-1 rounded px-2.5 py-1.5 text-xs font-medium ${
+                    viewMode === "map" ? "bg-blue-50 text-blue-700" : "text-gray-600 hover:bg-gray-50"
+                  }`}
+                >
+                  <MapIcon className="h-3.5 w-3.5" />
+                  地图
                 </button>
               </div>
               {viewMode === "tree" && (
@@ -1036,7 +1126,23 @@ export default function FileList({
             </div>
           )}
 
-          {viewMode === "tree" ? (
+          {viewMode === "map" ? (
+            <div style={{ height: LIST_PANEL_HEIGHT, minHeight: `${LIST_PANEL_MIN_HEIGHT}px` }}>
+              <TreemapView
+                scanId={scanId}
+                viewPath={viewPath}
+                sizeMode={sizeMode}
+                formatFileSize={formatFileSize}
+                isPreview={isPreview}
+                previewItems={previewSorted}
+                selectedPaths={selectedPaths}
+                onSelect={selectOnly}
+                onToggleSelect={toggleSelect}
+                onDrill={drillIntoMap}
+                onQueryError={() => setIndexStale(true)}
+              />
+            </div>
+          ) : viewMode === "tree" ? (
             <div
               ref={treeContainerRef}
               tabIndex={0}

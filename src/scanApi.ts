@@ -34,3 +34,10 @@ export function deletePath(
 ): Promise<DeleteResult> {
   return invoke("delete_path", { path, scanId });
 }
+
+export function deletePaths(
+  paths: string[],
+  scanId: string | null,
+): Promise<DeleteResult> {
+  return invoke("delete_paths", { paths, scanId });
+}

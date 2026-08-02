@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import {
   Calendar,
   ChevronDown,
@@ -9,6 +9,7 @@ import {
   FolderOpen,
   List,
   ListTree,
+  Loader2,
   MoreHorizontal,
   RotateCw,
   Search,
@@ -16,38 +17,35 @@ import {
   X,
 } from "lucide-react";
 
-import type { FileInfo } from "../types";
+import { queryFlatFiles, querySubtree } from "../scanApi";
+import { getSizeValue } from "../scanInsights";
+import type { FileInfo, FlatModifiedWindow, FlatSortMode } from "../types";
 
 interface FileListProps {
-  files: FileInfo[];
-  sessionKey: number;
+  scanId: string | null;
   scanRoot: string;
   isPreview: boolean;
-  focusedPath?: string | null;
+  previewItems: FileInfo[];
+  sizeMode: "logical" | "disk";
+  activeTypeFilter: string | null;
+  onTypeFilterChange: (type: string | null) => void;
   onDelete: (file: FileInfo) => void;
   onShowInFinder: (file: FileInfo) => void;
   onCopyPath: (file: FileInfo) => void;
   onRescanDirectory: (file: FileInfo) => void;
+  onRescanRoot: () => void;
   formatFileSize: (bytes: number) => string;
-  sizeMode: "logical" | "disk";
+  focusedPath?: string | null;
+  listVersion: number;
 }
 
-interface TreeNode {
-  item: FileInfo;
-  children: TreeNode[];
-}
-
-interface TreeResult {
-  roots: TreeNode[];
-  nodeMap: Map<string, TreeNode>;
-}
-
-interface FlatNode {
-  item: FileInfo;
+interface TreeRow {
+  file: FileInfo;
   depth: number;
   hasChildren: boolean;
 }
 
+const PAGE_SIZE = 200;
 const MAX_BAR_WIDTH = 100;
 const LIST_PANEL_HEIGHT = "calc(100vh - 320px)";
 const LIST_PANEL_MIN_HEIGHT = 420;
@@ -61,11 +59,6 @@ const FLAT_MODIFIED_FILTER_STORAGE_KEY = "mac-disk-scanner.flat-modified-filter"
 const SIZE_100_MB = 100 * 1024 * 1024;
 const SIZE_1_GB = 1024 * 1024 * 1024;
 const SIZE_10_GB = 10 * 1024 * 1024 * 1024;
-const SECONDS_IN_DAY = 24 * 60 * 60;
-
-type FlatSortMode = "size" | "modified" | "name";
-type FlatSizeFilter = "all" | "100mb" | "1gb" | "10gb";
-type FlatModifiedFilter = "all" | "30d" | "180d" | "365d";
 
 function normalizePath(path: string): string {
   if (path === "/") return "/";
@@ -80,10 +73,6 @@ function getParentPath(path: string): string | null {
   return normalized.slice(0, index);
 }
 
-function getSizeValue(file: FileInfo, sizeMode: "logical" | "disk") {
-  return sizeMode === "disk" ? file.sizeDisk : file.sizeLogical;
-}
-
 function formatDate(timestamp: number | null): string {
   if (!timestamp) return "未知";
   const date = new Date(timestamp * 1000);
@@ -93,77 +82,6 @@ function formatDate(timestamp: number | null): string {
   const hh = String(date.getHours()).padStart(2, "0");
   const mm = String(date.getMinutes()).padStart(2, "0");
   return `${y}-${m}-${d} ${hh}:${mm}`;
-}
-
-function buildTree(
-  files: FileInfo[],
-  scanRoot: string,
-  sizeMode: "logical" | "disk",
-): TreeResult {
-  const normalizedRoot = normalizePath(scanRoot);
-  const nodeMap = new Map<string, TreeNode>();
-  const roots: TreeNode[] = [];
-
-  for (const file of files) {
-    const path = normalizePath(file.path);
-    const node: TreeNode = {
-      item: { ...file, path },
-      children: [],
-    };
-    nodeMap.set(path, node);
-    const parentPath = getParentPath(node.item.path);
-    const parentNode =
-      parentPath && parentPath !== normalizedRoot
-        ? nodeMap.get(parentPath)
-        : undefined;
-
-    if (parentNode) {
-      parentNode.children.push(node);
-      continue;
-    }
-
-    roots.push(node);
-  }
-
-  const sortNodes = (nodes: TreeNode[]) => {
-    nodes.sort((a, b) => {
-      const sizeDelta = getSizeValue(b.item, sizeMode) - getSizeValue(a.item, sizeMode);
-      if (sizeDelta !== 0) return sizeDelta;
-
-      return a.item.path.localeCompare(b.item.path);
-    });
-
-    for (const node of nodes) {
-      sortNodes(node.children);
-    }
-  };
-
-  sortNodes(roots);
-  return { roots, nodeMap };
-}
-
-function flattenTree(
-  nodes: TreeNode[],
-  expandedPaths: Set<string>,
-): FlatNode[] {
-  const flat: FlatNode[] = [];
-
-  const walk = (currentNodes: TreeNode[], depth: number) => {
-    for (const node of currentNodes) {
-      flat.push({
-        item: node.item,
-        depth,
-        hasChildren: node.children.length > 0,
-      });
-
-      if (node.children.length > 0 && expandedPaths.has(node.item.path)) {
-        walk(node.children, depth + 1);
-      }
-    }
-  };
-
-  walk(nodes, 0);
-  return flat;
 }
 
 function buildPathSegments(scanRoot: string, currentPath: string) {
@@ -191,64 +109,45 @@ function buildPathSegments(scanRoot: string, currentPath: string) {
 
 function getStoredViewMode(): "tree" | "flat" {
   if (typeof window === "undefined") return "tree";
-
-  const stored = window.localStorage.getItem(RESULT_VIEW_MODE_STORAGE_KEY);
-  return stored === "flat" ? "flat" : "tree";
+  return window.localStorage.getItem(RESULT_VIEW_MODE_STORAGE_KEY) === "flat"
+    ? "flat"
+    : "tree";
 }
 
 function getStoredFlatSortMode(): FlatSortMode {
   if (typeof window === "undefined") return "size";
-
   const stored = window.localStorage.getItem(FLAT_SORT_MODE_STORAGE_KEY);
   if (stored === "modified" || stored === "name") return stored;
   return "size";
 }
 
-function getStoredFlatSizeFilter(): FlatSizeFilter {
+function getStoredFlatSizeFilter(): "all" | "100mb" | "1gb" | "10gb" {
   if (typeof window === "undefined") return "all";
-
   const stored = window.localStorage.getItem(FLAT_SIZE_FILTER_STORAGE_KEY);
   if (stored === "100mb" || stored === "1gb" || stored === "10gb") return stored;
   return "all";
 }
 
-function getStoredFlatModifiedFilter(): FlatModifiedFilter {
+function getStoredFlatModifiedFilter(): "all" | "30d" | "180d" | "365d" {
   if (typeof window === "undefined") return "all";
-
   const stored = window.localStorage.getItem(FLAT_MODIFIED_FILTER_STORAGE_KEY);
   if (stored === "30d" || stored === "180d" || stored === "365d") return stored;
   return "all";
 }
 
-function matchesFlatSizeFilter(
-  item: FileInfo,
-  sizeMode: "logical" | "disk",
-  filter: FlatSizeFilter,
-) {
-  const size = getSizeValue(item, sizeMode);
-  if (filter === "100mb") return size >= SIZE_100_MB;
-  if (filter === "1gb") return size >= SIZE_1_GB;
-  if (filter === "10gb") return size >= SIZE_10_GB;
-  return true;
+function sizeFilterToMinSize(filter: "all" | "100mb" | "1gb" | "10gb"): number | null {
+  if (filter === "100mb") return SIZE_100_MB;
+  if (filter === "1gb") return SIZE_1_GB;
+  if (filter === "10gb") return SIZE_10_GB;
+  return null;
 }
 
-function matchesFlatModifiedFilter(
-  item: FileInfo,
-  filter: FlatModifiedFilter,
-  nowSeconds: number,
-) {
-  if (filter === "all") return true;
-  if (!item.modified) return false;
-
-  const ageSeconds = nowSeconds - item.modified;
-  if (filter === "30d") return ageSeconds <= 30 * SECONDS_IN_DAY;
-  if (filter === "180d") return ageSeconds <= 180 * SECONDS_IN_DAY;
-  return ageSeconds <= 365 * SECONDS_IN_DAY;
+function modifiedFilterToWindow(filter: "all" | "30d" | "180d" | "365d"): FlatModifiedWindow {
+  return filter;
 }
 
 function isTextEntryTarget(target: EventTarget | null) {
   if (!(target instanceof HTMLElement)) return false;
-
   const tagName = target.tagName.toLowerCase();
   return (
     tagName === "input" ||
@@ -262,198 +161,278 @@ function clampIndex(index: number, maxIndex: number) {
   return Math.min(Math.max(index, 0), maxIndex);
 }
 
+function isIndexNotFoundError(err: unknown): boolean {
+  return String(err).includes("IndexNotFound");
+}
+
 export default function FileList({
-  files,
-  sessionKey,
+  scanId,
   scanRoot,
   isPreview,
-  focusedPath,
+  previewItems,
+  sizeMode,
+  activeTypeFilter,
+  onTypeFilterChange,
   onDelete,
   onShowInFinder,
   onCopyPath,
   onRescanDirectory,
+  onRescanRoot,
   formatFileSize,
-  sizeMode,
+  focusedPath,
+  listVersion,
 }: FileListProps) {
   const normalizedRoot = useMemo(() => normalizePath(scanRoot), [scanRoot]);
-  const { roots, nodeMap } = useMemo(
-    () => buildTree(files, normalizedRoot, sizeMode),
-    [files, normalizedRoot, sizeMode],
-  );
 
-  const treeContainerRef = useRef<HTMLDivElement | null>(null);
-  const flatContainerRef = useRef<HTMLDivElement | null>(null);
-  const selectedRowRef = useRef<HTMLElement | null>(null);
-  const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => new Set());
-  const [viewPath, setViewPath] = useState(normalizedRoot);
   const [viewMode, setViewMode] = useState<"tree" | "flat">(getStoredViewMode);
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [openMenuPath, setOpenMenuPath] = useState<string | null>(null);
+  const [indexStale, setIndexStale] = useState(false);
+
+  // Tree state (query-driven).
+  const [viewPath, setViewPath] = useState(normalizedRoot);
+  const [expandedPaths, setExpandedPaths] = useState<Set<string>>(new Set());
+  const [childrenByPath, setChildrenByPath] = useState<Map<string, FileInfo[]>>(new Map());
+  const [childTotalByPath, setChildTotalByPath] = useState<Map<string, number>>(new Map());
+  const [treeLoadingPath, setTreeLoadingPath] = useState<string | null>(null);
+
+  // Flat state (query-driven).
+  const [flatSizeFilter, setFlatSizeFilter] = useState<
+    "all" | "100mb" | "1gb" | "10gb"
+  >(getStoredFlatSizeFilter);
+  const [flatModifiedFilter, setFlatModifiedFilter] = useState<
+    "all" | "30d" | "180d" | "365d"
+  >(getStoredFlatModifiedFilter);
+  const [flatSortMode, setFlatSortMode] = useState<FlatSortMode>(
+    getStoredFlatSortMode,
+  );
+  const [flatSearchQuery, setFlatSearchQuery] = useState("");
+  const [flatItems, setFlatItems] = useState<FileInfo[]>([]);
+  const [flatTotal, setFlatTotal] = useState(0);
+  const [flatHasMore, setFlatHasMore] = useState(false);
+  const [flatLoading, setFlatLoading] = useState(false);
+
+  const selectedRowRef = useRef<HTMLElement | null>(null);
+  const treeContainerRef = useRef<HTMLDivElement | null>(null);
+  const flatContainerRef = useRef<HTMLDivElement | null>(null);
   const [flatScrollTop, setFlatScrollTop] = useState(0);
   const [flatViewportHeight, setFlatViewportHeight] = useState(LIST_PANEL_MIN_HEIGHT);
-  const [flatSearchQuery, setFlatSearchQuery] = useState("");
-  const [flatSortMode, setFlatSortMode] = useState<FlatSortMode>(getStoredFlatSortMode);
-  const [flatSizeFilter, setFlatSizeFilter] = useState<FlatSizeFilter>(getStoredFlatSizeFilter);
-  const [flatModifiedFilter, setFlatModifiedFilter] = useState<FlatModifiedFilter>(
-    getStoredFlatModifiedFilter,
-  );
 
-  useEffect(() => {
-    setExpandedPaths(new Set());
-    setViewPath(normalizedRoot);
-    setSelectedPath(null);
-    setOpenMenuPath(null);
-    setFlatScrollTop(0);
-    setFlatSearchQuery("");
-  }, [normalizedRoot, sessionKey]);
-
-  useEffect(() => {
-    setSelectedPath((current) => {
-      if (!current) return files[0]?.path ?? null;
-      return files.some((file) => normalizePath(file.path) === normalizePath(current))
-        ? current
-        : files[0]?.path ?? null;
-    });
-  }, [files]);
-
+  // Persist preferences.
   useEffect(() => {
     window.localStorage.setItem(RESULT_VIEW_MODE_STORAGE_KEY, viewMode);
   }, [viewMode]);
-
   useEffect(() => {
     window.localStorage.setItem(FLAT_SORT_MODE_STORAGE_KEY, flatSortMode);
   }, [flatSortMode]);
-
   useEffect(() => {
     window.localStorage.setItem(FLAT_SIZE_FILTER_STORAGE_KEY, flatSizeFilter);
   }, [flatSizeFilter]);
-
   useEffect(() => {
     window.localStorage.setItem(FLAT_MODIFIED_FILTER_STORAGE_KEY, flatModifiedFilter);
   }, [flatModifiedFilter]);
 
+  // Reset all view state when the scan changes.
   useEffect(() => {
-    if (viewPath === normalizedRoot) return;
-    if (!nodeMap.has(viewPath)) {
-      setViewPath(normalizedRoot);
-    }
-  }, [nodeMap, normalizedRoot, viewPath]);
-
-  useEffect(() => {
-    if (!focusedPath) return;
-
-    const normalizedFocusedPath = normalizePath(focusedPath);
-    const focusedFile = files.find(
-      (file) => normalizePath(file.path) === normalizedFocusedPath,
-    );
-    if (!focusedFile) return;
-
-    setSelectedPath(focusedFile.path);
+    setViewPath(normalizedRoot);
+    setExpandedPaths(new Set());
+    setChildrenByPath(new Map());
+    setChildTotalByPath(new Map());
+    setSelectedPath(null);
     setOpenMenuPath(null);
+    setFlatItems([]);
+    setFlatTotal(0);
+    setFlatHasMore(false);
+    setIndexStale(false);
+  }, [scanId, normalizedRoot, listVersion]);
 
-    if (focusedFile.is_dir) {
-      setViewPath(focusedFile.path);
-      return;
-    }
+  // Load the current tree directory's children.
+  const loadTreeChildren = useCallback(
+    async (path: string, offset: number) => {
+      if (!scanId) return;
+      setTreeLoadingPath(path);
+      try {
+        const page = await querySubtree(scanId, path, sizeMode, offset, PAGE_SIZE);
+        setChildrenByPath((prev) => {
+          const existing = prev.get(path) ?? [];
+          const merged = offset === 0 ? page.items : [...existing, ...page.items];
+          return new Map(prev).set(path, merged);
+        });
+        setChildTotalByPath((prev) => new Map(prev).set(path, page.total));
+      } catch (err) {
+        if (isIndexNotFoundError(err)) setIndexStale(true);
+      } finally {
+        setTreeLoadingPath((current) => (current === path ? null : current));
+      }
+    },
+    [scanId, sizeMode],
+  );
 
-    setViewPath(getParentPath(focusedFile.path) ?? normalizedRoot);
-  }, [files, focusedPath, normalizedRoot]);
+  // Load the flat view page (offset 0 = fresh query).
+  const loadFlatPage = useCallback(
+    async (offset: number) => {
+      if (!scanId) return;
+      setFlatLoading(true);
+      try {
+        const page = await queryFlatFiles({
+          scanId,
+          minSize: sizeFilterToMinSize(flatSizeFilter),
+          modifiedWindow: modifiedFilterToWindow(flatModifiedFilter),
+          searchQuery: flatSearchQuery.trim() || undefined,
+          type: activeTypeFilter,
+          sort: flatSortMode,
+          sortDesc: flatSortMode !== "name",
+          sizeMode,
+          offset,
+          limit: PAGE_SIZE,
+        });
+        setFlatItems((prev) => (offset === 0 ? page.items : [...prev, ...page.items]));
+        setFlatTotal(page.total);
+        setFlatHasMore(page.hasMore);
+      } catch (err) {
+        if (isIndexNotFoundError(err)) setIndexStale(true);
+      } finally {
+        setFlatLoading(false);
+      }
+    },
+    [scanId, flatSizeFilter, flatModifiedFilter, flatSearchQuery, activeTypeFilter, flatSortMode, sizeMode],
+  );
 
+  // (Re)load flat view when filters, scan, mode, or version change.
+  useEffect(() => {
+    if (!scanId || isPreview) return;
+    void loadFlatPage(0);
+  }, [scanId, flatSizeFilter, flatModifiedFilter, flatSortMode, flatSearchQuery, activeTypeFilter, sizeMode, isPreview, listVersion]);
+
+  // Load the tree root when the scan completes; reload when size mode toggles.
+  useEffect(() => {
+    if (!scanId || isPreview) return;
+    void loadTreeChildren(viewPath, 0);
+  }, [scanId, viewPath, sizeMode, isPreview, listVersion]);
+
+  // Keep selection valid.
+  useEffect(() => {
+    setSelectedPath((current) => {
+      if (!current) return null;
+      return current;
+    });
+  }, [flatItems, viewPath]);
+
+  // Navigate to a focused path (from insights).
+  useEffect(() => {
+    if (!focusedPath || !scanId) return;
+    const focused = normalizePath(focusedPath);
+    setOpenMenuPath(null);
+    // Find whether focused exists in any loaded cache; otherwise navigate to parent.
+    const parent = getParentPath(focused);
+    const target = parent ?? normalizedRoot;
+    setViewPath(target);
+    setSelectedPath(focused);
+  }, [focusedPath, scanId, normalizedRoot]);
+
+  // Scroll selected row into view.
+  useEffect(() => {
+    if (!selectedPath || !selectedRowRef.current) return;
+    selectedRowRef.current.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [selectedPath, viewMode, viewPath, expandedPaths, flatItems.length]);
+
+  // Measure flat viewport height.
   useEffect(() => {
     if (viewMode !== "flat") return;
-
     const measure = () => {
       const nextHeight = flatContainerRef.current?.clientHeight;
       if (!nextHeight) return;
       setFlatViewportHeight(nextHeight);
     };
-
     measure();
     window.addEventListener("resize", measure);
     return () => window.removeEventListener("resize", measure);
   }, [viewMode]);
 
-  const branchNodes = useMemo(() => {
-    if (viewPath === normalizedRoot) {
-      return roots;
-    }
-
-    return nodeMap.get(viewPath)?.children ?? [];
-  }, [nodeMap, normalizedRoot, roots, viewPath]);
-
-  const flatNodes = useMemo(
-    () => flattenTree(branchNodes, expandedPaths),
-    [branchNodes, expandedPaths],
-  );
-  const flatFiles = useMemo(
-    () => [...files].sort((a, b) => {
-      if (flatSortMode === "modified") {
-        const modifiedDelta = (b.modified ?? 0) - (a.modified ?? 0);
-        if (modifiedDelta !== 0) return modifiedDelta;
-      } else if (flatSortMode === "name") {
-        const nameDelta = a.name.localeCompare(b.name);
-        if (nameDelta !== 0) return nameDelta;
-      } else {
-        const sizeDelta = getSizeValue(b, sizeMode) - getSizeValue(a, sizeMode);
-        if (sizeDelta !== 0) return sizeDelta;
-      }
-
-      const fallbackSizeDelta = getSizeValue(b, sizeMode) - getSizeValue(a, sizeMode);
-      if (fallbackSizeDelta !== 0) return fallbackSizeDelta;
-      return a.path.localeCompare(b.path);
-    }),
-    [files, flatSortMode, sizeMode],
-  );
-  const normalizedFlatSearchQuery = flatSearchQuery.trim().toLowerCase();
-  const nowSeconds = Date.now() / 1000;
-  const filteredFlatFiles = useMemo(() => {
-    return flatFiles.filter((item) => {
-      if (!matchesFlatSizeFilter(item, sizeMode, flatSizeFilter)) {
-        return false;
-      }
-
-      if (!matchesFlatModifiedFilter(item, flatModifiedFilter, nowSeconds)) {
-        return false;
-      }
-
-      if (!normalizedFlatSearchQuery) return true;
-
-      const lowerName = item.name.toLowerCase();
-      const lowerPath = item.path.toLowerCase();
-      return (
-        lowerName.includes(normalizedFlatSearchQuery) ||
-        lowerPath.includes(normalizedFlatSearchQuery)
-      );
-    });
-  }, [
-    flatFiles,
-    flatModifiedFilter,
-    flatSizeFilter,
-    normalizedFlatSearchQuery,
-    nowSeconds,
-    sizeMode,
-  ]);
-
-  const totalSize = useMemo(
-    () =>
-      branchNodes.reduce((sum, node) => sum + getSizeValue(node.item, sizeMode), 0),
-    [branchNodes, sizeMode],
-  );
-  const flatTotalSize = useMemo(
-    () =>
-      filteredFlatFiles.reduce((sum, item) => sum + getSizeValue(item, sizeMode), 0),
-    [filteredFlatFiles, sizeMode],
-  );
-
-  const selectedFile =
-    files.find((file) => normalizePath(file.path) === normalizePath(selectedPath ?? "")) ?? null;
+  // ---- derived data ----
 
   const pathSegments = useMemo(
     () => buildPathSegments(normalizedRoot, viewPath),
     [normalizedRoot, viewPath],
   );
+  const canGoUp = viewPath !== normalizedRoot;
 
-  const toggleExpand = (path: string) => {
+  const treeRows = useMemo<TreeRow[]>(() => {
+    const rows: TreeRow[] = [];
+    const walk = (files: FileInfo[], depth: number) => {
+      for (const file of files) {
+        const hasChildren = file.is_dir;
+        rows.push({ file, depth, hasChildren });
+        if (file.is_dir && expandedPaths.has(file.path)) {
+          const kids = childrenByPath.get(file.path);
+          if (kids) walk(kids, depth + 1);
+        }
+      }
+    };
+    walk(childrenByPath.get(viewPath) ?? [], 0);
+    return rows;
+  }, [viewPath, expandedPaths, childrenByPath]);
+
+  const treeViewChildren = childrenByPath.get(viewPath) ?? [];
+  const treeChildrenTotal = childTotalByPath.get(viewPath) ?? 0;
+  const currentListSize = treeViewChildren.reduce(
+    (sum, file) => sum + getSizeValue(file, sizeMode),
+    0,
+  );
+
+  const flatTotalSize = useMemo(
+    () => flatItems.reduce((sum, file) => sum + getSizeValue(file, sizeMode), 0),
+    [flatItems, sizeMode],
+  );
+
+  const selectedFile = useMemo(() => {
+    if (!selectedPath) return null;
+    const findIn = (list: FileInfo[]) =>
+      list.find((f) => normalizePath(f.path) === normalizePath(selectedPath));
+    return (
+      findIn(flatItems) ??
+      treeRows.map((r) => r.file).find((f) => normalizePath(f.path) === normalizePath(selectedPath)) ??
+      null
+    );
+  }, [selectedPath, flatItems, treeRows]);
+
+  const previewSorted = useMemo(
+    () =>
+      [...previewItems].sort((a, b) => {
+        const delta = getSizeValue(b, sizeMode) - getSizeValue(a, sizeMode);
+        return delta !== 0 ? delta : a.path.localeCompare(b.path);
+      }),
+    [previewItems, sizeMode],
+  );
+
+  const navigableItems: TreeRow[] = useMemo(() => {
+    if (viewMode === "flat") {
+      return flatItems.map((file) => ({ file, depth: 0, hasChildren: file.is_dir }));
+    }
+    return treeRows;
+  }, [viewMode, flatItems, treeRows]);
+
+  const selectedIndex = navigableItems.findIndex(
+    (row) => normalizePath(row.file.path) === normalizePath(selectedPath ?? ""),
+  );
+  const selectedNavigableItem =
+    selectedIndex >= 0 ? navigableItems[selectedIndex] : null;
+
+  const selectNavigableIndex = (index: number) => {
+    if (navigableItems.length === 0) return;
+    const nextItem = navigableItems[clampIndex(index, navigableItems.length - 1)];
+    setSelectedPath(nextItem.file.path);
+    setOpenMenuPath(null);
+  };
+
+  const enterDirectory = (item: FileInfo) => {
+    if (!item.is_dir) return false;
+    setViewPath(item.path);
+    setOpenMenuPath(null);
+    return true;
+  };
+
+  const toggleExpand = async (path: string) => {
     setExpandedPaths((current) => {
       const next = new Set(current);
       if (next.has(path)) {
@@ -463,81 +442,21 @@ export default function FileList({
       }
       return next;
     });
-  };
-
-  const handleMenuAction = (action: () => void) => {
-    action();
-    setOpenMenuPath(null);
-  };
-
-  const canGoUp = viewPath !== normalizedRoot;
-  const currentLevelLabel =
-    viewMode === "flat"
-      ? "全部结果"
-      : viewPath === normalizedRoot
-        ? "根目录"
-        : viewPath;
-  const currentListSize = viewMode === "flat" ? flatTotalSize : totalSize;
-  const flatStartIndex = Math.max(
-    0,
-    Math.floor(flatScrollTop / FLAT_ROW_HEIGHT) - FLAT_OVERSCAN,
-  );
-  const flatEndIndex = Math.min(
-    filteredFlatFiles.length,
-    Math.ceil((flatScrollTop + flatViewportHeight) / FLAT_ROW_HEIGHT) + FLAT_OVERSCAN,
-  );
-  const visibleFlatFiles = filteredFlatFiles.slice(flatStartIndex, flatEndIndex);
-  const flatOffsetTop = flatStartIndex * FLAT_ROW_HEIGHT;
-  const flatTotalHeight = filteredFlatFiles.length * FLAT_ROW_HEIGHT;
-  const hasActiveFlatFilters =
-    flatSizeFilter !== "all" || flatModifiedFilter !== "all" || normalizedFlatSearchQuery.length > 0;
-  const navigableItems = viewMode === "flat"
-    ? filteredFlatFiles.map((item) => ({
-        item,
-        hasChildren: (nodeMap.get(normalizePath(item.path))?.children.length ?? 0) > 0,
-      }))
-    : flatNodes.map(({ item, hasChildren }) => ({ item, hasChildren }));
-  const selectedIndex = navigableItems.findIndex(
-    ({ item }) => normalizePath(item.path) === normalizePath(selectedPath ?? ""),
-  );
-  const selectedNavigableItem =
-    selectedIndex >= 0 ? navigableItems[selectedIndex] : null;
-
-  const selectNavigableIndex = (index: number) => {
-    if (navigableItems.length === 0) return;
-
-    const nextItem = navigableItems[clampIndex(index, navigableItems.length - 1)];
-    setSelectedPath(nextItem.item.path);
-    setOpenMenuPath(null);
-  };
-
-  const enterDirectory = (item: FileInfo) => {
-    if (!item.is_dir) return false;
-
-    if (viewMode === "flat") {
-      setViewMode("tree");
+    if (!childrenByPath.has(path)) {
+      await loadTreeChildren(path, 0);
     }
-
-    setViewPath(item.path);
-    setExpandedPaths((current) => {
-      const next = new Set(current);
-      next.add(item.path);
-      return next;
-    });
-    setOpenMenuPath(null);
-    return true;
   };
 
   const handleListKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if (
       event.target !== event.currentTarget ||
       isTextEntryTarget(event.target) ||
-      navigableItems.length === 0
+      navigableItems.length === 0 ||
+      isPreview
     ) {
       return;
     }
 
-    const current = selectedNavigableItem ?? navigableItems[0];
     const indexForMovement = selectedIndex >= 0 ? selectedIndex : 0;
 
     if (event.key === "ArrowDown") {
@@ -545,114 +464,190 @@ export default function FileList({
       selectNavigableIndex(indexForMovement + 1);
       return;
     }
-
     if (event.key === "ArrowUp") {
       event.preventDefault();
       selectNavigableIndex(indexForMovement - 1);
       return;
     }
-
     if (event.key === "Home") {
       event.preventDefault();
       selectNavigableIndex(0);
       return;
     }
-
     if (event.key === "End") {
       event.preventDefault();
       selectNavigableIndex(navigableItems.length - 1);
       return;
     }
-
+    const current = selectedNavigableItem ?? navigableItems[0];
     if (event.key === "ArrowRight" && current.hasChildren) {
       event.preventDefault();
-      if (viewMode === "tree" && !expandedPaths.has(current.item.path)) {
-        toggleExpand(current.item.path);
+      if (viewMode === "tree" && !expandedPaths.has(current.file.path)) {
+        void toggleExpand(current.file.path);
         return;
       }
-      enterDirectory(current.item);
+      enterDirectory(current.file);
       return;
     }
-
     if (event.key === "ArrowLeft") {
       event.preventDefault();
-      if (viewMode === "tree" && current.hasChildren && expandedPaths.has(current.item.path)) {
-        toggleExpand(current.item.path);
+      if (viewMode === "tree" && current.hasChildren && expandedPaths.has(current.file.path)) {
+        setExpandedPaths((prev) => {
+          const next = new Set(prev);
+          next.delete(current.file.path);
+          return next;
+        });
         return;
       }
-
       if (viewMode === "tree" && canGoUp) {
         setViewPath(getParentPath(viewPath) ?? normalizedRoot);
       }
       return;
     }
-
     if (event.key === "Enter") {
       event.preventDefault();
-      if (!enterDirectory(current.item)) {
-        onShowInFinder(current.item);
+      if (!enterDirectory(current.file)) {
+        onShowInFinder(current.file);
       }
       return;
     }
-
     if (event.key === " ") {
       event.preventDefault();
-      setOpenMenuPath((openPath) =>
-        openPath === current.item.path ? null : current.item.path,
+      setOpenMenuPath((open) =>
+        open === current.file.path ? null : current.file.path,
       );
       return;
     }
-
     if (event.key === "Delete" || event.key === "Backspace") {
-      if (isPreview) return;
       event.preventDefault();
-      onDelete(current.item);
+      onDelete(current.file);
     }
   };
 
-  useEffect(() => {
-    if (viewMode !== "flat" || !selectedPath || !flatContainerRef.current) return;
+  const flatStartIndex = Math.max(
+    0,
+    Math.floor(flatScrollTop / FLAT_ROW_HEIGHT) - FLAT_OVERSCAN,
+  );
+  const flatEndIndex = Math.min(
+    flatItems.length,
+    Math.ceil((flatScrollTop + flatViewportHeight) / FLAT_ROW_HEIGHT) + FLAT_OVERSCAN,
+  );
+  const visibleFlatItems = flatItems.slice(flatStartIndex, flatEndIndex);
+  const flatOffsetTop = flatStartIndex * FLAT_ROW_HEIGHT;
+  const flatTotalHeight = flatItems.length * FLAT_ROW_HEIGHT;
 
-    const index = filteredFlatFiles.findIndex(
-      (item) => normalizePath(item.path) === normalizePath(selectedPath),
+  const hasActiveFlatFilters =
+    flatSizeFilter !== "all" ||
+    flatModifiedFilter !== "all" ||
+    flatSearchQuery.trim().length > 0 ||
+    !!activeTypeFilter;
+
+  // ---- render helpers ----
+
+  const renderRow = (
+    file: FileInfo,
+    depth: number,
+    hasChildren: boolean,
+    key: string,
+  ) => {
+    const itemSize = getSizeValue(file, sizeMode);
+    const ratio =
+      currentListSize > 0
+        ? Math.min((itemSize / currentListSize) * MAX_BAR_WIDTH, MAX_BAR_WIDTH)
+        : 0;
+    const isSelected = normalizePath(selectedPath ?? "") === normalizePath(file.path);
+    return (
+      <tr
+        key={key}
+        ref={(node) => {
+          if (isSelected) selectedRowRef.current = node;
+        }}
+        className={`border-b border-gray-100 transition-colors ${
+          isSelected ? "bg-blue-50/80" : "hover:bg-gray-50"
+        }`}
+      >
+        <td className="px-6 py-3">
+          <div
+            className="flex min-w-0 items-center gap-2"
+            style={{ paddingLeft: `${depth * 20}px` }}
+          >
+            {hasChildren ? (
+              <button
+                type="button"
+                onClick={() => void toggleExpand(file.path)}
+                className="flex h-6 w-6 items-center justify-center rounded-md text-gray-500 hover:bg-gray-100"
+                title={expandedPaths.has(file.path) ? "折叠目录" : "展开目录"}
+              >
+                {expandedPaths.has(file.path) ? (
+                  <ChevronDown className="h-4 w-4" />
+                ) : (
+                  <ChevronRight className="h-4 w-4" />
+                )}
+              </button>
+            ) : (
+              <span className="block h-6 w-6" />
+            )}
+            {file.is_dir ? (
+              <Folder className="h-4 w-4 flex-shrink-0 text-blue-500" />
+            ) : (
+              <File className="h-4 w-4 flex-shrink-0 text-gray-500" />
+            )}
+            <button
+              type="button"
+              onClick={() => {
+                setSelectedPath(file.path);
+                treeContainerRef.current?.focus();
+              }}
+              className="min-w-0 text-left"
+            >
+              <div className="truncate text-sm font-medium text-gray-900">
+                {file.name}
+              </div>
+              <div className="truncate text-xs text-gray-500">{file.path}</div>
+            </button>
+          </div>
+        </td>
+        <td className="px-4 py-3 align-middle">
+          <span
+            className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${
+              file.is_dir ? "bg-blue-100 text-blue-700" : "bg-gray-100 text-gray-700"
+            }`}
+          >
+            {file.is_dir ? "目录" : "文件"}
+          </span>
+        </td>
+        <td className="px-4 py-3 align-middle">
+          <div className="space-y-1.5">
+            <div className="text-sm font-semibold text-gray-900">
+              {formatFileSize(itemSize)}
+            </div>
+            <div className="h-2 rounded-full bg-gray-100">
+              <div
+                className="h-2 rounded-full bg-blue-500 transition-[width] duration-300"
+                style={{ width: `${ratio}%` }}
+              />
+            </div>
+            <div className="text-xs text-gray-500">
+              占当前视图{" "}
+              {currentListSize > 0
+                ? ((itemSize / currentListSize) * 100).toFixed(1)
+                : "0.0"}
+              %
+            </div>
+          </div>
+        </td>
+        <td className="px-4 py-3 align-middle text-sm text-gray-500">
+          <div className="flex items-center gap-2 whitespace-nowrap">
+            <Calendar className="h-4 w-4 text-gray-400" />
+            {formatDate(file.modified)}
+          </div>
+        </td>
+        <td className="px-4 py-3 align-middle">
+          {renderItemActions(file, hasChildren)}
+        </td>
+      </tr>
     );
-    if (index === -1) return;
-
-    const targetTop = index * FLAT_ROW_HEIGHT;
-    const viewportBottom = flatScrollTop + flatViewportHeight - FLAT_ROW_HEIGHT;
-    if (targetTop >= flatScrollTop && targetTop <= viewportBottom) return;
-
-    flatContainerRef.current.scrollTo({
-      top: Math.max(0, targetTop - flatViewportHeight / 2 + FLAT_ROW_HEIGHT / 2),
-    });
-  }, [
-    filteredFlatFiles,
-    flatScrollTop,
-    flatViewportHeight,
-    selectedPath,
-    viewMode,
-  ]);
-
-  useEffect(() => {
-    if (viewMode !== "tree" || !selectedPath || !selectedRowRef.current) return;
-
-    selectedRowRef.current.scrollIntoView({
-      block: "nearest",
-      inline: "nearest",
-    });
-  }, [selectedPath, viewMode, viewPath, expandedPaths]);
-
-  useEffect(() => {
-    if (viewMode !== "flat") return;
-    setFlatScrollTop(0);
-    flatContainerRef.current?.scrollTo({ top: 0 });
-  }, [
-    flatModifiedFilter,
-    flatSizeFilter,
-    flatSortMode,
-    normalizedFlatSearchQuery,
-    viewMode,
-  ]);
+  };
 
   const renderItemActions = (item: FileInfo, hasChildren: boolean) => (
     <div className="relative flex justify-end">
@@ -672,7 +667,10 @@ export default function FileList({
           {item.is_dir && hasChildren && (
             <button
               type="button"
-              onClick={() => handleMenuAction(() => setViewPath(item.path))}
+              onClick={() => {
+                setOpenMenuPath(null);
+                setViewPath(item.path);
+              }}
               className="flex w-full items-center gap-2 px-3 py-2 text-left text-gray-700 hover:bg-gray-50"
             >
               <FolderOpen className="h-4 w-4 text-gray-500" />
@@ -682,7 +680,10 @@ export default function FileList({
 
           <button
             type="button"
-            onClick={() => handleMenuAction(() => onShowInFinder(item))}
+            onClick={() => {
+              setOpenMenuPath(null);
+              onShowInFinder(item);
+            }}
             className="flex w-full items-center gap-2 px-3 py-2 text-left text-gray-700 hover:bg-gray-50"
           >
             <FolderOpen className="h-4 w-4 text-gray-500" />
@@ -691,7 +692,10 @@ export default function FileList({
 
           <button
             type="button"
-            onClick={() => handleMenuAction(() => onCopyPath(item))}
+            onClick={() => {
+              setOpenMenuPath(null);
+              onCopyPath(item);
+            }}
             className="flex w-full items-center gap-2 px-3 py-2 text-left text-gray-700 hover:bg-gray-50"
           >
             <Copy className="h-4 w-4 text-gray-500" />
@@ -701,7 +705,10 @@ export default function FileList({
           {item.is_dir && (
             <button
               type="button"
-              onClick={() => handleMenuAction(() => onRescanDirectory(item))}
+              onClick={() => {
+                setOpenMenuPath(null);
+                onRescanDirectory(item);
+              }}
               disabled={isPreview}
               className="flex w-full items-center gap-2 px-3 py-2 text-left text-gray-700 hover:bg-gray-50 disabled:cursor-not-allowed disabled:text-gray-400"
             >
@@ -714,7 +721,10 @@ export default function FileList({
 
           <button
             type="button"
-            onClick={() => handleMenuAction(() => onDelete(item))}
+            onClick={() => {
+              setOpenMenuPath(null);
+              onDelete(item);
+            }}
             disabled={isPreview}
             className="flex w-full items-center gap-2 px-3 py-2 text-left text-red-600 hover:bg-red-50 disabled:cursor-not-allowed disabled:text-gray-400 disabled:hover:bg-white"
           >
@@ -726,14 +736,127 @@ export default function FileList({
     </div>
   );
 
+  // ---- empty / stale states ----
+
+  if (indexStale) {
+    return (
+      <div className="flex h-full min-h-[420px] items-center justify-center rounded-xl border border-gray-200 bg-white px-8">
+        <div className="text-center">
+          <div className="text-sm font-medium text-gray-900">扫描结果已失效</div>
+          <div className="mt-1 text-sm text-gray-500">
+            索引已被回收，请重新扫描以继续查看。
+          </div>
+          <button
+            type="button"
+            onClick={onRescanRoot}
+            className="mt-4 rounded-md border border-blue-200 bg-blue-50 px-4 py-2 text-sm font-medium text-blue-700 hover:bg-blue-100"
+          >
+            重新扫描
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (!scanId && !isPreview) {
+    return (
+      <div className="flex h-full min-h-[420px] items-center justify-center rounded-xl border border-gray-200 bg-white">
+        <div className="text-center">
+          <FolderOpen className="h-16 w-16 text-gray-300 mx-auto mb-4" />
+          <h3 className="text-lg font-medium text-gray-900 mb-2">暂无扫描结果</h3>
+          <p className="text-gray-500">选择一个目录开始扫描</p>
+        </div>
+      </div>
+    );
+  }
+
+  // ---- preview state: read-only flat list from streaming events ----
+
+  if (isPreview) {
+    return (
+      <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+        <div className="px-6 py-4 border-b border-gray-200 bg-gray-50">
+          <div className="flex items-center justify-between">
+            <div>
+              <h2 className="text-lg font-semibold text-gray-900">
+                扫描中预览 ({previewSorted.length} 项)
+              </h2>
+              <p className="mt-1 text-sm text-gray-500">
+                正在扫描，已发现的大文件将在这里实时展示；扫描完成后切换为完整结果。
+              </p>
+            </div>
+            <div className="text-xs text-gray-400">
+              当前口径: {sizeMode === "disk" ? "磁盘使用量" : "逻辑大小"}
+            </div>
+          </div>
+          <div className="mt-3 border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+            列表仍在变化，最终结果将在扫描完成后基于完整索引展示。
+          </div>
+        </div>
+        <div className="max-h-[60vh] overflow-auto">
+          <table className="min-w-[920px] w-full table-fixed border-collapse">
+            <thead className="sticky top-0 z-10 bg-gray-50">
+              <tr>
+                <th className="w-[40%] px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">名称</th>
+                <th className="w-[12%] px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">类型</th>
+                <th className="w-[22%] px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">大小</th>
+                <th className="w-[18%] px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">修改时间</th>
+                <th className="w-[8%] px-4 py-3 text-right text-xs font-medium uppercase tracking-wider text-gray-500">操作</th>
+              </tr>
+            </thead>
+            <tbody className="bg-white">
+              {previewSorted.map((file) => (
+                <tr key={file.path} className="border-b border-gray-100 hover:bg-gray-50">
+                  <td className="px-6 py-3">
+                    <div className="flex min-w-0 items-center gap-2">
+                      {file.is_dir ? (
+                        <Folder className="h-4 w-4 flex-shrink-0 text-blue-500" />
+                      ) : (
+                        <File className="h-4 w-4 flex-shrink-0 text-gray-500" />
+                      )}
+                      <div className="min-w-0">
+                        <div className="truncate text-sm font-medium text-gray-900">{file.name}</div>
+                        <div className="truncate text-xs text-gray-500">{file.path}</div>
+                      </div>
+                    </div>
+                  </td>
+                  <td className="px-4 py-3 align-middle">
+                    <span className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${file.is_dir ? "bg-blue-100 text-blue-700" : "bg-gray-100 text-gray-700"}`}>
+                      {file.is_dir ? "目录" : "文件"}
+                    </span>
+                  </td>
+                  <td className="px-4 py-3 align-middle text-sm font-semibold text-gray-900">
+                    {formatFileSize(getSizeValue(file, sizeMode))}
+                  </td>
+                  <td className="px-4 py-3 align-middle text-sm text-gray-500">
+                    {formatDate(file.modified)}
+                  </td>
+                  <td className="px-4 py-3 align-middle" />
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {previewSorted.length === 0 && (
+            <div className="flex h-full min-h-[360px] items-center justify-center px-8 text-sm text-gray-500">
+              正在发现大文件...
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // ---- final: query-driven tree + flat ----
+
+  const currentLevelLabel =
+    viewMode === "flat" ? "全部结果" : viewPath === normalizedRoot ? "根目录" : viewPath;
+
   return (
     <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
       <div className="px-6 py-4 border-b border-gray-200 bg-gray-50">
         <div className="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">
           <div>
-            <h2 className="text-lg font-semibold text-gray-900">
-              {isPreview ? "扫描中预览" : "扫描结果"} ({files.length} 项)
-            </h2>
+            <h2 className="text-lg font-semibold text-gray-900">扫描结果</h2>
             <div className="mt-2 flex flex-wrap items-center gap-2 text-sm text-gray-500">
               {pathSegments.map((segment, index) => (
                 <div key={segment.path} className="flex items-center gap-2">
@@ -755,21 +878,22 @@ export default function FileList({
           </div>
 
           <div className="text-right text-sm text-gray-500">
-            <div>
-              {isPreview
-                ? "预览结果会持续变化"
-                : viewMode === "tree"
-                  ? "树形表格支持逐层展开和查看详情"
-                  : "平铺视图按体积排序，并对长列表做窗口化渲染"}
-            </div>
-            <div className="mt-1 text-xs text-gray-400">
-              当前层级: {currentLevelLabel}
-            </div>
+            <div>{viewMode === "tree" ? "树形视图按目录展开，逐层加载" : "平铺视图基于完整索引分页加载"}</div>
+            <div className="mt-1 text-xs text-gray-400">当前层级: {currentLevelLabel}</div>
           </div>
         </div>
-        {isPreview && (
-          <div className="mt-3 border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
-            当前列表是扫描中的预览结果。大小、目录层级和展示项会继续变化，最终结果将在扫描完成后替换此视图。
+        {activeTypeFilter && (
+          <div className="mt-3 flex items-center justify-between rounded-lg border border-blue-200 bg-blue-50 px-4 py-3">
+            <div className="flex items-center gap-2 text-sm text-blue-800">
+              当前平铺视图仅显示类型: {activeTypeFilter}
+            </div>
+            <button
+              type="button"
+              onClick={() => onTypeFilterChange(null)}
+              className="rounded-md border border-blue-200 bg-white px-3 py-1.5 text-xs font-medium text-blue-700 transition-colors hover:bg-blue-100"
+            >
+              清除筛选
+            </button>
           </div>
         )}
       </div>
@@ -778,7 +902,11 @@ export default function FileList({
         <div className="border-r border-gray-200">
           <div className="flex items-center justify-between px-6 py-3 border-b border-gray-200 bg-white">
             <div className="text-sm text-gray-500">
-              当前视图合计: <span className="font-semibold text-gray-900">{formatFileSize(currentListSize)}</span>
+              {viewMode === "tree" ? (
+                <>当前目录合计: <span className="font-semibold text-gray-900">{formatFileSize(currentListSize)}</span></>
+              ) : (
+                <>共 {flatTotal.toLocaleString()} 项 · 已加载 {flatItems.length.toLocaleString()} 项</>
+              )}
             </div>
             <div className="flex items-center gap-2">
               <div className="inline-flex rounded-md border border-gray-200 bg-white p-0.5">
@@ -786,9 +914,7 @@ export default function FileList({
                   type="button"
                   onClick={() => setViewMode("tree")}
                   className={`inline-flex items-center gap-1 rounded px-2.5 py-1.5 text-xs font-medium ${
-                    viewMode === "tree"
-                      ? "bg-blue-50 text-blue-700"
-                      : "text-gray-600 hover:bg-gray-50"
+                    viewMode === "tree" ? "bg-blue-50 text-blue-700" : "text-gray-600 hover:bg-gray-50"
                   }`}
                 >
                   <ListTree className="h-3.5 w-3.5" />
@@ -798,9 +924,7 @@ export default function FileList({
                   type="button"
                   onClick={() => setViewMode("flat")}
                   className={`inline-flex items-center gap-1 rounded px-2.5 py-1.5 text-xs font-medium ${
-                    viewMode === "flat"
-                      ? "bg-blue-50 text-blue-700"
-                      : "text-gray-600 hover:bg-gray-50"
+                    viewMode === "flat" ? "bg-blue-50 text-blue-700" : "text-gray-600 hover:bg-gray-50"
                   }`}
                 >
                   <List className="h-3.5 w-3.5" />
@@ -819,8 +943,7 @@ export default function FileList({
                   <button
                     type="button"
                     onClick={() => {
-                      if (!canGoUp) return;
-                      setViewPath(getParentPath(viewPath) ?? normalizedRoot);
+                      if (canGoUp) setViewPath(getParentPath(viewPath) ?? normalizedRoot);
                     }}
                     disabled={!canGoUp}
                     className="px-3 py-1.5 text-xs font-medium rounded-md border border-gray-200 text-gray-700 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed"
@@ -842,7 +965,7 @@ export default function FileList({
                       type="text"
                       value={flatSearchQuery}
                       onChange={(event) => setFlatSearchQuery(event.target.value)}
-                      placeholder="搜索名称或路径"
+                      placeholder="搜索名称或路径（完整索引）"
                       className="min-w-0 flex-1 bg-transparent text-sm text-gray-900 outline-none placeholder:text-gray-400"
                     />
                     {flatSearchQuery && (
@@ -857,141 +980,44 @@ export default function FileList({
                     )}
                   </label>
                   <div className="inline-flex rounded-md border border-gray-200 bg-white p-0.5">
-                    <button
-                      type="button"
-                      onClick={() => setFlatSortMode("size")}
-                      className={`rounded px-2.5 py-1.5 text-xs font-medium ${
-                        flatSortMode === "size"
-                          ? "bg-blue-50 text-blue-700"
-                          : "text-gray-600 hover:bg-gray-50"
-                      }`}
-                    >
-                      按大小
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setFlatSortMode("modified")}
-                      className={`rounded px-2.5 py-1.5 text-xs font-medium ${
-                        flatSortMode === "modified"
-                          ? "bg-blue-50 text-blue-700"
-                          : "text-gray-600 hover:bg-gray-50"
-                      }`}
-                    >
-                      按时间
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setFlatSortMode("name")}
-                      className={`rounded px-2.5 py-1.5 text-xs font-medium ${
-                        flatSortMode === "name"
-                          ? "bg-blue-50 text-blue-700"
-                          : "text-gray-600 hover:bg-gray-50"
-                      }`}
-                    >
-                      按名称
-                    </button>
+                    <button type="button" onClick={() => setFlatSortMode("size")}
+                      className={`rounded px-2.5 py-1.5 text-xs font-medium ${flatSortMode === "size" ? "bg-blue-50 text-blue-700" : "text-gray-600 hover:bg-gray-50"}`}>按大小</button>
+                    <button type="button" onClick={() => setFlatSortMode("modified")}
+                      className={`rounded px-2.5 py-1.5 text-xs font-medium ${flatSortMode === "modified" ? "bg-blue-50 text-blue-700" : "text-gray-600 hover:bg-gray-50"}`}>按时间</button>
+                    <button type="button" onClick={() => setFlatSortMode("name")}
+                      className={`rounded px-2.5 py-1.5 text-xs font-medium ${flatSortMode === "name" ? "bg-blue-50 text-blue-700" : "text-gray-600 hover:bg-gray-50"}`}>按名称</button>
                   </div>
                 </div>
                 <div className="text-xs text-gray-500">
-                  {filteredFlatFiles.length.toLocaleString()} / {flatFiles.length.toLocaleString()} 项
+                  {flatTotal.toLocaleString()} 项
                 </div>
               </div>
 
               <div className="flex flex-wrap items-center gap-2">
                 <div className="inline-flex rounded-md border border-gray-200 bg-white p-0.5">
-                  <button
-                    type="button"
-                    onClick={() => setFlatSizeFilter("all")}
-                    className={`rounded px-2.5 py-1.5 text-xs font-medium ${
-                      flatSizeFilter === "all"
-                        ? "bg-blue-50 text-blue-700"
-                        : "text-gray-600 hover:bg-gray-50"
-                    }`}
-                  >
-                    全部体积
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setFlatSizeFilter("100mb")}
-                    className={`rounded px-2.5 py-1.5 text-xs font-medium ${
-                      flatSizeFilter === "100mb"
-                        ? "bg-blue-50 text-blue-700"
-                        : "text-gray-600 hover:bg-gray-50"
-                    }`}
-                  >
-                    ≥ 100 MB
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setFlatSizeFilter("1gb")}
-                    className={`rounded px-2.5 py-1.5 text-xs font-medium ${
-                      flatSizeFilter === "1gb"
-                        ? "bg-blue-50 text-blue-700"
-                        : "text-gray-600 hover:bg-gray-50"
-                    }`}
-                  >
-                    ≥ 1 GB
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setFlatSizeFilter("10gb")}
-                    className={`rounded px-2.5 py-1.5 text-xs font-medium ${
-                      flatSizeFilter === "10gb"
-                        ? "bg-blue-50 text-blue-700"
-                        : "text-gray-600 hover:bg-gray-50"
-                    }`}
-                  >
-                    ≥ 10 GB
-                  </button>
+                  {(["all", "100mb", "1gb", "10gb"] as const).map((key) => (
+                    <button
+                      key={key}
+                      type="button"
+                      onClick={() => setFlatSizeFilter(key)}
+                      className={`rounded px-2.5 py-1.5 text-xs font-medium ${flatSizeFilter === key ? "bg-blue-50 text-blue-700" : "text-gray-600 hover:bg-gray-50"}`}
+                    >
+                      {key === "all" ? "全部体积" : `≥ ${key === "100mb" ? "100 MB" : key === "1gb" ? "1 GB" : "10 GB"}`}
+                    </button>
+                  ))}
                 </div>
-
                 <div className="inline-flex rounded-md border border-gray-200 bg-white p-0.5">
-                  <button
-                    type="button"
-                    onClick={() => setFlatModifiedFilter("all")}
-                    className={`rounded px-2.5 py-1.5 text-xs font-medium ${
-                      flatModifiedFilter === "all"
-                        ? "bg-blue-50 text-blue-700"
-                        : "text-gray-600 hover:bg-gray-50"
-                    }`}
-                  >
-                    全部时间
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setFlatModifiedFilter("30d")}
-                    className={`rounded px-2.5 py-1.5 text-xs font-medium ${
-                      flatModifiedFilter === "30d"
-                        ? "bg-blue-50 text-blue-700"
-                        : "text-gray-600 hover:bg-gray-50"
-                    }`}
-                  >
-                    近 30 天
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setFlatModifiedFilter("180d")}
-                    className={`rounded px-2.5 py-1.5 text-xs font-medium ${
-                      flatModifiedFilter === "180d"
-                        ? "bg-blue-50 text-blue-700"
-                        : "text-gray-600 hover:bg-gray-50"
-                    }`}
-                  >
-                    近半年
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setFlatModifiedFilter("365d")}
-                    className={`rounded px-2.5 py-1.5 text-xs font-medium ${
-                      flatModifiedFilter === "365d"
-                        ? "bg-blue-50 text-blue-700"
-                        : "text-gray-600 hover:bg-gray-50"
-                    }`}
-                  >
-                    近 1 年
-                  </button>
+                  {(["all", "30d", "180d", "365d"] as const).map((key) => (
+                    <button
+                      key={key}
+                      type="button"
+                      onClick={() => setFlatModifiedFilter(key)}
+                      className={`rounded px-2.5 py-1.5 text-xs font-medium ${flatModifiedFilter === key ? "bg-blue-50 text-blue-700" : "text-gray-600 hover:bg-gray-50"}`}
+                    >
+                      {key === "all" ? "全部时间" : key === "30d" ? "近 30 天" : key === "180d" ? "近半年" : "近 1 年"}
+                    </button>
+                  ))}
                 </div>
-
                 {hasActiveFlatFilters && (
                   <button
                     type="button"
@@ -999,6 +1025,7 @@ export default function FileList({
                       setFlatSearchQuery("");
                       setFlatSizeFilter("all");
                       setFlatModifiedFilter("all");
+                      onTypeFilterChange(null);
                     }}
                     className="rounded-md border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-700 hover:bg-gray-50"
                   >
@@ -1020,138 +1047,37 @@ export default function FileList({
               <table className="min-w-[920px] w-full table-fixed border-collapse">
                 <thead className="sticky top-0 z-10 bg-gray-50">
                   <tr>
-                    <th className="w-[40%] px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">
-                      名称
-                    </th>
-                    <th className="w-[12%] px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">
-                      类型
-                    </th>
-                    <th className="w-[22%] px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">
-                      大小
-                    </th>
-                    <th className="w-[18%] px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">
-                      修改时间
-                    </th>
-                    <th className="w-[8%] px-4 py-3 text-right text-xs font-medium uppercase tracking-wider text-gray-500">
-                      操作
-                    </th>
+                    <th className="w-[40%] px-6 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">名称</th>
+                    <th className="w-[12%] px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">类型</th>
+                    <th className="w-[22%] px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">大小</th>
+                    <th className="w-[18%] px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">修改时间</th>
+                    <th className="w-[8%] px-4 py-3 text-right text-xs font-medium uppercase tracking-wider text-gray-500">操作</th>
                   </tr>
                 </thead>
                 <tbody className="bg-white">
-                  {flatNodes.map(({ item, depth, hasChildren }) => {
-                    const itemSize = getSizeValue(item, sizeMode);
-                    const ratio = currentListSize > 0
-                      ? Math.min((itemSize / currentListSize) * MAX_BAR_WIDTH, MAX_BAR_WIDTH)
-                      : 0;
-                    const isExpanded = expandedPaths.has(item.path);
-                    const isSelected = normalizePath(selectedPath ?? "") === item.path;
-
-                    return (
-                      <tr
-                        key={item.path}
-                        ref={(node) => {
-                          if (isSelected) selectedRowRef.current = node;
-                        }}
-                        className={`border-b border-gray-100 transition-colors ${
-                          isSelected ? "bg-blue-50/80" : "hover:bg-gray-50"
-                        }`}
-                      >
-                        <td className="px-6 py-3">
-                          <div
-                            className="flex min-w-0 items-center gap-2"
-                            style={{ paddingLeft: `${depth * 20}px` }}
-                          >
-                            {hasChildren ? (
-                              <button
-                                type="button"
-                                onClick={() => toggleExpand(item.path)}
-                                className="flex h-6 w-6 items-center justify-center rounded-md text-gray-500 hover:bg-gray-100"
-                                title={isExpanded ? "折叠目录" : "展开目录"}
-                              >
-                                {isExpanded ? (
-                                  <ChevronDown className="h-4 w-4" />
-                                ) : (
-                                  <ChevronRight className="h-4 w-4" />
-                                )}
-                              </button>
-                            ) : (
-                              <span className="block h-6 w-6" />
-                            )}
-
-                            {item.is_dir ? (
-                              <Folder className="h-4 w-4 flex-shrink-0 text-blue-500" />
-                            ) : (
-                              <File className="h-4 w-4 flex-shrink-0 text-gray-500" />
-                            )}
-
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setSelectedPath(item.path);
-                                treeContainerRef.current?.focus();
-                              }}
-                              className="min-w-0 text-left"
-                            >
-                              <div className="truncate text-sm font-medium text-gray-900">
-                                {item.name}
-                              </div>
-                              <div className="truncate text-xs text-gray-500">{item.path}</div>
-                            </button>
-                          </div>
-                        </td>
-
-                        <td className="px-4 py-3 align-middle">
-                          <span
-                            className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${
-                              item.is_dir
-                                ? "bg-blue-100 text-blue-700"
-                                : "bg-gray-100 text-gray-700"
-                            }`}
-                          >
-                            {item.is_dir ? "目录" : "文件"}
-                          </span>
-                        </td>
-
-                        <td className="px-4 py-3 align-middle">
-                          <div className="space-y-1.5">
-                            <div className="text-sm font-semibold text-gray-900">
-                              {formatFileSize(itemSize)}
-                            </div>
-                            <div className="h-2 rounded-full bg-gray-100">
-                              <div
-                                className="h-2 rounded-full bg-blue-500 transition-[width] duration-300"
-                                style={{ width: `${ratio}%` }}
-                              />
-                            </div>
-                            <div className="text-xs text-gray-500">
-                              占当前视图 {currentListSize > 0 ? ((itemSize / currentListSize) * 100).toFixed(1) : "0.0"}%
-                            </div>
-                          </div>
-                        </td>
-
-                        <td className="px-4 py-3 align-middle text-sm text-gray-500">
-                          <div className="flex items-center gap-2 whitespace-nowrap">
-                            <Calendar className="h-4 w-4 text-gray-400" />
-                            {formatDate(item.modified)}
-                          </div>
-                        </td>
-
-                        <td className="px-4 py-3 align-middle">
-                          {renderItemActions(item, hasChildren)}
-                        </td>
-                      </tr>
-                    );
-                  })}
+                  {treeRows.map((row) => renderRow(row.file, row.depth, row.hasChildren, row.file.path))}
+                  {treeChildrenTotal > (childrenByPath.get(viewPath)?.length ?? 0) && (
+                    <tr>
+                      <td colSpan={5} className="px-6 py-3 text-center">
+                        <button
+                          type="button"
+                          onClick={() => void loadTreeChildren(viewPath, childrenByPath.get(viewPath)?.length ?? 0)}
+                          disabled={treeLoadingPath === viewPath}
+                          className="inline-flex items-center gap-1 rounded-md border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-700 hover:bg-gray-50"
+                        >
+                          {treeLoadingPath === viewPath ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+                          加载更多（剩余 {(childrenByPath.get(viewPath)?.length ?? 0)} / {treeChildrenTotal}）
+                        </button>
+                      </td>
+                    </tr>
+                  )}
                 </tbody>
               </table>
-
-              {flatNodes.length === 0 && (
+              {treeViewChildren.length === 0 && (
                 <div className="flex h-full min-h-[360px] items-center justify-center px-8">
                   <div className="text-center">
-                    <div className="text-sm font-medium text-gray-900">当前层级没有可展示项</div>
-                    <div className="mt-1 text-sm text-gray-500">
-                      返回上一级，或降低最小大小限制后重新扫描
-                    </div>
+                    <div className="text-sm font-medium text-gray-900">当前目录没有可展示项</div>
+                    <div className="mt-1 text-sm text-gray-500">返回上一级或选择其他目录</div>
                   </div>
                 </div>
               )}
@@ -1165,103 +1091,84 @@ export default function FileList({
               style={{ height: LIST_PANEL_HEIGHT, minHeight: `${LIST_PANEL_MIN_HEIGHT}px` }}
               onScroll={(event) => setFlatScrollTop(event.currentTarget.scrollTop)}
             >
-              {filteredFlatFiles.length === 0 ? (
+              {flatItems.length === 0 && !flatLoading ? (
                 <div className="flex h-full min-h-[360px] items-center justify-center px-8">
                   <div className="text-center">
                     <div className="text-sm font-medium text-gray-900">
                       {hasActiveFlatFilters ? "没有匹配当前筛选条件的结果" : "当前没有可展示项"}
                     </div>
-                    <div className="mt-1 text-sm text-gray-500">
-                      {hasActiveFlatFilters
-                        ? "放宽搜索、体积或时间条件后再试"
-                        : "调整筛选条件，或重新扫描后再查看"}
-                    </div>
+                    <div className="mt-1 text-sm text-gray-500">放宽筛选条件后再试</div>
                   </div>
                 </div>
               ) : (
                 <div style={{ height: `${flatTotalHeight}px`, position: "relative" }}>
-                  <div
-                    style={{
-                      transform: `translateY(${flatOffsetTop}px)`,
-                    }}
-                  >
-                    {visibleFlatFiles.map((item) => {
-                      const itemSize = getSizeValue(item, sizeMode);
-                      const ratio = currentListSize > 0
-                        ? Math.min((itemSize / currentListSize) * MAX_BAR_WIDTH, MAX_BAR_WIDTH)
-                        : 0;
-                      const isSelected =
-                        normalizePath(selectedPath ?? "") === normalizePath(item.path);
-                      const hasChildren = (nodeMap.get(normalizePath(item.path))?.children.length ?? 0) > 0;
-
+                  <div style={{ transform: `translateY(${flatOffsetTop}px)` }}>
+                    {visibleFlatItems.map((file) => {
+                      const itemSize = getSizeValue(file, sizeMode);
+                      const ratio = flatTotalSize > 0 ? Math.min((itemSize / flatTotalSize) * MAX_BAR_WIDTH, MAX_BAR_WIDTH) : 0;
+                      const isSelected = normalizePath(selectedPath ?? "") === normalizePath(file.path);
                       return (
                         <div
-                          key={item.path}
+                          key={file.path}
                           ref={(node) => {
                             if (isSelected) selectedRowRef.current = node;
                           }}
-                          className={`grid grid-cols-[minmax(0,1.7fr)_120px_180px_170px_56px] items-center gap-4 border-b border-gray-100 px-6 py-3 transition-colors ${
-                            isSelected ? "bg-blue-50/80" : "hover:bg-gray-50"
-                          }`}
+                          className={`grid grid-cols-[minmax(0,1.7fr)_120px_180px_170px_56px] items-center gap-4 border-b border-gray-100 px-6 py-3 transition-colors ${isSelected ? "bg-blue-50/80" : "hover:bg-gray-50"}`}
                           style={{ height: `${FLAT_ROW_HEIGHT}px` }}
                         >
                           <button
                             type="button"
                             onClick={() => {
-                              setSelectedPath(item.path);
+                              setSelectedPath(file.path);
                               flatContainerRef.current?.focus();
                             }}
                             className="min-w-0 text-left"
                           >
                             <div className="flex min-w-0 items-center gap-2">
-                              {item.is_dir ? (
-                                <Folder className="h-4 w-4 flex-shrink-0 text-blue-500" />
-                              ) : (
-                                <File className="h-4 w-4 flex-shrink-0 text-gray-500" />
-                              )}
+                              {file.is_dir ? <Folder className="h-4 w-4 flex-shrink-0 text-blue-500" /> : <File className="h-4 w-4 flex-shrink-0 text-gray-500" />}
                               <div className="min-w-0">
-                                <div className="truncate text-sm font-medium text-gray-900">
-                                  {item.name}
-                                </div>
-                                <div className="truncate text-xs text-gray-500">{item.path}</div>
+                                <div className="truncate text-sm font-medium text-gray-900">{file.name}</div>
+                                <div className="truncate text-xs text-gray-500">{file.path}</div>
                               </div>
                             </div>
                           </button>
-
                           <div>
-                            <span
-                              className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${
-                                item.is_dir
-                                  ? "bg-blue-100 text-blue-700"
-                                  : "bg-gray-100 text-gray-700"
-                              }`}
-                            >
-                              {item.is_dir ? "目录" : "文件"}
+                            <span className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${file.is_dir ? "bg-blue-100 text-blue-700" : "bg-gray-100 text-gray-700"}`}>
+                              {file.is_dir ? "目录" : "文件"}
                             </span>
                           </div>
-
                           <div className="space-y-1.5">
-                            <div className="text-sm font-semibold text-gray-900">
-                              {formatFileSize(itemSize)}
-                            </div>
+                            <div className="text-sm font-semibold text-gray-900">{formatFileSize(itemSize)}</div>
                             <div className="h-2 rounded-full bg-gray-100">
-                              <div
-                                className="h-2 rounded-full bg-blue-500 transition-[width] duration-300"
-                                style={{ width: `${ratio}%` }}
-                              />
+                              <div className="h-2 rounded-full bg-blue-500 transition-[width] duration-300" style={{ width: `${ratio}%` }} />
                             </div>
                           </div>
-
                           <div className="flex items-center gap-2 text-sm text-gray-500">
                             <Calendar className="h-4 w-4 text-gray-400" />
-                            {formatDate(item.modified)}
+                            {formatDate(file.modified)}
                           </div>
-
-                          {renderItemActions(item, hasChildren)}
+                          <div className="relative flex justify-end">{renderItemActions(file, file.is_dir)}</div>
                         </div>
                       );
                     })}
                   </div>
+                </div>
+              )}
+              {flatLoading && (
+                <div className="flex items-center justify-center gap-2 py-4 text-sm text-gray-500">
+                  <Loader2 className="h-4 w-4 animate-spin text-blue-600" />
+                  加载中...
+                </div>
+              )}
+              {flatHasMore && !flatLoading && (
+                <div className="flex justify-center py-4">
+                  <button
+                    type="button"
+                    onClick={() => void loadFlatPage(flatItems.length)}
+                    className="rounded-md border border-gray-200 bg-white px-4 py-2 text-xs font-medium text-gray-700 hover:bg-gray-50"
+                  >
+                    加载更多（已加载 {flatItems.length} / {flatTotal}）
+                  </button>
                 </div>
               )}
             </div>
@@ -1271,13 +1178,8 @@ export default function FileList({
         <aside className="bg-gray-50/70">
           <div className="border-b border-gray-200 px-6 py-4">
             <h3 className="text-sm font-semibold text-gray-900">详情</h3>
-            <p className="mt-1 text-xs text-gray-500">
-              {isPreview
-                ? "预览态下大小和目录结构仍可能变化"
-                : "选中一项后查看路径、大小和更新时间"}
-            </p>
+            <p className="mt-1 text-xs text-gray-500">选中一项后查看路径、大小和更新时间</p>
           </div>
-
           <div className="space-y-5 px-6 py-5">
             {selectedFile ? (
               <>
@@ -1285,34 +1187,23 @@ export default function FileList({
                   <div className="text-sm font-medium text-gray-900">{selectedFile.name}</div>
                   <div className="mt-1 text-xs text-gray-500 break-all">{selectedFile.path}</div>
                 </div>
-
                 <dl className="space-y-4 text-sm">
                   <div>
                     <dt className="text-xs uppercase tracking-wider text-gray-500">类型</dt>
                     <dd className="mt-1 text-gray-900">{selectedFile.is_dir ? "目录" : "文件"}</dd>
                   </div>
-
                   <div>
                     <dt className="text-xs uppercase tracking-wider text-gray-500">当前显示大小</dt>
-                    <dd className="mt-1 text-gray-900">
-                      {formatFileSize(getSizeValue(selectedFile, sizeMode))}
-                    </dd>
+                    <dd className="mt-1 text-gray-900">{formatFileSize(getSizeValue(selectedFile, sizeMode))}</dd>
                   </div>
-
                   <div>
                     <dt className="text-xs uppercase tracking-wider text-gray-500">逻辑大小</dt>
-                    <dd className="mt-1 text-gray-900">
-                      {formatFileSize(selectedFile.sizeLogical)}
-                    </dd>
+                    <dd className="mt-1 text-gray-900">{formatFileSize(selectedFile.sizeLogical)}</dd>
                   </div>
-
                   <div>
                     <dt className="text-xs uppercase tracking-wider text-gray-500">磁盘占用</dt>
-                    <dd className="mt-1 text-gray-900">
-                      {formatFileSize(selectedFile.sizeDisk)}
-                    </dd>
+                    <dd className="mt-1 text-gray-900">{formatFileSize(selectedFile.sizeDisk)}</dd>
                   </div>
-
                   <div>
                     <dt className="text-xs uppercase tracking-wider text-gray-500">修改时间</dt>
                     <dd className="mt-1 text-gray-900">{formatDate(selectedFile.modified)}</dd>

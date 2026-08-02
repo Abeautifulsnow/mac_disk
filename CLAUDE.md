@@ -64,15 +64,18 @@ cargo run         # Run Rust application directly
 ### Frontend-Backend Communication
 - **Tauri Commands**: Frontend calls Rust functions via `invoke()` API
 - **Commands** (`src-tauri/src/commands.rs`):
-  - `scan_directory`: Recursively scans directory, returns large files/folders
-  - `delete_path`: Deletes files/directories with safety checks
-- **Data Flow**: User input → React component → Tauri command → Rust scanner → Results display
+  - `scan_directory_with_progress`: Scans a directory, builds a complete queryable index, streams progress/cancel/preview events
+  - `query_flat_files` / `query_subtree` / `query_dir_size`: Paginated, server-side-filtered queries over the index
+  - `delete_path`: Moves to Trash with safety checks, then keeps the index consistent (removes subtree, recomputes totals/insights)
+  - `cancel_scan` / `show_in_finder`: Scan cancellation and Finder reveal
+- **Data Flow**: User input → React component → Tauri command → Rust scanner builds index → frontend queries results on demand
 
 ### Disk Scanning Logic
-- **Scanner Module** (`src-tauri/src/scanner.rs`): Uses `walkdir` crate for recursive traversal
-- **Performance**: Has TODO comment about poor performance - consider optimization
-- **Safety**: Prevents deletion of system directories (`/system`, `/library`, `/usr`, etc.)
-- **Configuration**: Minimum file size and result limit filters
+- **Scanner Module** (`src-tauri/src/scanner.rs`): Uses `walkdir` crate for recursive traversal; builds a complete `ScanIndex` (`src-tauri/src/index.rs`)
+- **Complete index**: No top-K truncation — every regular file is retained and queryable; directory aggregates are always complete; `minSize` is a query/UI filter only
+- **Three size dimensions**: `sizeLogical`, `sizeDisk` (blocks×512, 0 when blocks are zero — never falls back to logical), `physicalUnique` (hard-link-deduplicated, non-additive)
+- **Coverage**: Permission-denied / I/O errors are recorded as `unscannedRegions`; partial scans are flagged, never presented as complete
+- **Safety**: Prevents deletion of system directories (`/system`, `/library`, `/usr`, etc.); deletions go to Trash (recoverable until emptied)
 
 ### State Management
 - **React State**: Local component state in `App.tsx` (files, loading, error, confirmDelete)

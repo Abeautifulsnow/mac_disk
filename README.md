@@ -18,15 +18,17 @@ A high-performance desktop application for macOS that helps you identify and man
 - **Performance Optimized**: Single-pass streaming traversal with bounded top-K retention and efficient metadata reuse
 - **Progressive Scan Status**: Progress events show discovery and processing phases, and matching previews appear during the scan before final results are committed
 
-### ⚡ **Smart Filtering**
-- **Size Threshold**: Set minimum file size to filter out small items
-- **Result Limits**: Control the number of results displayed
-- **Timeout Protection**: Prevent long-running scans with configurable timeouts
-- **Depth Control**: Automatic depth limiting for system protection
+### ⚡ **Complete & Honest Index**
+- **No result truncation**: the scan builds a complete queryable index — every regular file is queryable, browsable, and deletable (the old top-K display cap is gone)
+- **Server-side filters**: flat-view size / time / search / type filters run against the complete index and return every match, never a truncated subset
+- **Partial-scan honesty**: permission-denied and I/O errors are recorded as unscanned regions; partial scans are explicitly labeled, never presented as complete statistics
+- **Three size dimensions**: logical size, allocated disk bytes (`blocks × 512`), and hard-link-deduplicated allocated bytes (non-additive; surfaced at scan-root or file level only)
+- **Timeout Protection**: prevent long-running scans with configurable timeouts
 
 ### 🛡️ **Safety Features**
 - **System Directory Protection**: Automatically blocks deletion of critical macOS system directories (`/system`, `/library`, `/usr`, etc.)
-- **Confirmation Dialogs**: All deletions require explicit user confirmation
+- **Trash-first, recoverable**: deletions move items to the Trash and are recoverable until the Trash is emptied — never permanent
+- **Scan-time snapshot**: results reflect the disk at scan completion; in-app deletions keep the index consistent, while external changes require a rescan
 - **Path Validation**: Backend validates all file paths before operations
 - **Error Handling**: Comprehensive error reporting with user-friendly messages
 
@@ -42,10 +44,12 @@ A high-performance desktop application for macOS that helps you identify and man
 The scan result contract uses explicit size fields across Rust and TypeScript:
 
 - `sizeLogical`: logical file content size from `metadata.len()`
-- `sizeDisk`: disk usage from `metadata.blocks() * 512`, falling back to logical size when block data is unavailable
+- `sizeDisk`: allocated disk usage from `metadata.blocks() * 512`; when blocks are zero the value is `0` (never falls back to logical size)
+- `physicalUnique`: allocated bytes after hard-link deduplication (per inode counted once; **non-additive** — never presented as a summable directory size)
+- `physicalUniqueTotal`: deduplicated allocated bytes for the whole scan root
 - `totalSizeLogical` / `totalSizeDisk`: total bytes scanned for the requested root
-- `filesFound` / `directoriesFound`: matched items before display truncation
-- `resultCount`: number of items returned to the frontend for display
+- `filesFound` / `directoriesFound`: all files and directories scanned (no truncation)
+- `scanCoverage`: entry count plus `unscannedRegions` (path + reason) and a `partial` flag for incomplete scans
 
 ## 🛠️ Technology Stack
 
@@ -69,14 +73,15 @@ The scan result contract uses explicit size fields across Rust and TypeScript:
 
 ## 📊 Performance Features
 
-The scanner includes sophisticated performance optimizations:
+The scanner builds a complete, queryable in-memory index (arena-based compact nodes):
 
-1. **Streaming Traversal**: Processes each `WalkDir` entry once instead of buffering the full tree before sizing
-2. **Bounded File Retention**: When `limit` is set, only the current top-K matching files are retained in memory
+1. **Streaming Traversal**: Processes each `WalkDir` entry once, inserting every regular file into the index
+2. **Complete Retention**: Every regular file is retained and queryable — no top-K truncation; directory aggregates are always complete
 3. **Efficient Metadata Reading**: Single metadata read per file, avoiding duplicate calls
-4. **Incremental Directory Aggregation**: Parent directory sizes are accumulated during traversal
-5. **Progress Logging**: Debug logs and progress events track traversal and final result assembly
-6. **Performance Metrics**: Detailed timing for metadata reads, aggregation, and sorting
+4. **Bounded Live Previews**: Preview events are emitted for large files (≤ 200 events) so the UI shows progress without flooding
+5. **Incremental Directory Aggregation**: Parent directory aggregates are computed bottom-up after the walk
+6. **Hard-link awareness**: Deduplicated allocated bytes are computed via `(dev, inode)` tracking
+7. **Coverage tracking**: Permission-denied / I/O failures are recorded as unscanned regions
 
 ## 🚀 Development
 
@@ -131,13 +136,11 @@ mac_disk/
 
 ## 💡 Future Enhancements
 
-- Real-time progress percentage display
-- Cancel functionality for long-running scans
-- Incremental results display during scanning
-- Caching mechanism for frequently accessed directories
-- Export results to CSV/JSON
-- File type statistics and charts
-- Sorting and filtering capabilities
+- Parallel scanning (rayon/jwalk) for full-volume speed
+- Whole-volume scan UX with per-volume overview
+- Interactive treemap visualization rendering live during the scan
+- Categorized "reclaimable space" report with safe, undoable batch cleanup
+- Scan history / "what changed since last scan" diffing
 
 ## 📝 License
 

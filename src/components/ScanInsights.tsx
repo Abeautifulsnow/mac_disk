@@ -6,17 +6,12 @@ import {
   FolderTree,
   Sparkles,
 } from "lucide-react";
-import { useMemo } from "react";
 
-import type { FileInfo } from "../types";
-import {
-  buildTypeBuckets,
-  getSizeValue,
-  type SizeMode,
-} from "../scanInsights";
+import type { Insights, InsightPick } from "../types";
+import type { SizeMode } from "../scanInsights";
 
 interface ScanInsightsProps {
-  files: FileInfo[];
+  insights: Insights;
   sizeMode: SizeMode;
   formatFileSize: (bytes: number) => string;
   onFocusPath: (path: string) => void;
@@ -24,121 +19,56 @@ interface ScanInsightsProps {
   onTypeFilterChange: (type: string | null) => void;
 }
 
-interface InsightItem {
+interface InsightCard {
   title: string;
   description: string;
-  path: string;
-  size: number;
+  pick: InsightPick;
 }
 
-const RECENT_WINDOW_SECONDS = 30 * 24 * 60 * 60;
-const STALE_WINDOW_SECONDS = 180 * 24 * 60 * 60;
-
-function pickLargerBySize(
-  current: FileInfo | null,
-  candidate: FileInfo,
-  sizeMode: SizeMode,
-) {
-  if (!current) return candidate;
-
-  const currentSize = getSizeValue(current, sizeMode);
-  const candidateSize = getSizeValue(candidate, sizeMode);
-  if (candidateSize !== currentSize) {
-    return candidateSize > currentSize ? candidate : current;
+function toCards(insights: Insights): InsightCard[] {
+  const cards: InsightCard[] = [];
+  if (insights.largestDirectory) {
+    cards.push({
+      title: "最大目录",
+      description: "先从体积最大的目录开始排查",
+      pick: insights.largestDirectory,
+    });
   }
-
-  return candidate.path.localeCompare(current.path) < 0 ? candidate : current;
-}
-
-function buildInsights(files: FileInfo[], sizeMode: SizeMode) {
-  const directories = files.filter((item) => item.is_dir);
-  const regularFiles = files.filter((item) => !item.is_dir);
-  const nowSeconds = Math.floor(Date.now() / 1000);
-
-  let largestDirectory: FileInfo | null = null;
-  for (const item of directories) {
-    largestDirectory = pickLargerBySize(largestDirectory, item, sizeMode);
+  if (insights.largestFile) {
+    cards.push({
+      title: "最大文件",
+      description: "单文件往往是最直接的清理入口",
+      pick: insights.largestFile,
+    });
   }
-
-  let largestFile: FileInfo | null = null;
-  for (const item of regularFiles) {
-    largestFile = pickLargerBySize(largestFile, item, sizeMode);
+  if (insights.recentLargeFile) {
+    cards.push({
+      title: "近期新增的大文件",
+      description: "最近 30 天内变大的内容值得优先确认",
+      pick: insights.recentLargeFile,
+    });
   }
-
-  let recentLargeFile: FileInfo | null = null;
-  for (const item of regularFiles) {
-    if (!item.modified) continue;
-    if (nowSeconds - item.modified > RECENT_WINDOW_SECONDS) continue;
-    recentLargeFile = pickLargerBySize(recentLargeFile, item, sizeMode);
+  if (insights.staleLargeFile) {
+    cards.push({
+      title: "长期未动的大文件",
+      description: "超过 180 天未修改的文件更适合清理或归档",
+      pick: insights.staleLargeFile,
+    });
   }
-  if (!recentLargeFile && regularFiles.length > 0) {
-    recentLargeFile = [...regularFiles].sort((a, b) => {
-      const modifiedDelta = (b.modified ?? 0) - (a.modified ?? 0);
-      if (modifiedDelta !== 0) return modifiedDelta;
-      return getSizeValue(b, sizeMode) - getSizeValue(a, sizeMode);
-    })[0];
-  }
-
-  let staleLargeFile: FileInfo | null = null;
-  for (const item of regularFiles) {
-    if (!item.modified) continue;
-    if (nowSeconds - item.modified < STALE_WINDOW_SECONDS) continue;
-    staleLargeFile = pickLargerBySize(staleLargeFile, item, sizeMode);
-  }
-  if (!staleLargeFile && regularFiles.length > 0) {
-    staleLargeFile = [...regularFiles].sort((a, b) => {
-      const modifiedDelta = (a.modified ?? Number.MAX_SAFE_INTEGER) - (b.modified ?? Number.MAX_SAFE_INTEGER);
-      if (modifiedDelta !== 0) return modifiedDelta;
-      return getSizeValue(b, sizeMode) - getSizeValue(a, sizeMode);
-    })[0];
-  }
-
-  const topTypes = buildTypeBuckets(files, sizeMode).slice(0, 6);
-
-  return {
-    largestDirectory,
-    largestFile,
-    recentLargeFile,
-    staleLargeFile,
-    topTypes,
-  };
-}
-
-function toInsightItem(
-  file: FileInfo | null,
-  sizeMode: SizeMode,
-  title: string,
-  description: string,
-): InsightItem | null {
-  if (!file) return null;
-
-  return {
-    title,
-    description,
-    path: file.path,
-    size: getSizeValue(file, sizeMode),
-  };
+  return cards;
 }
 
 export default function ScanInsights({
-  files,
+  insights,
   sizeMode,
   formatFileSize,
   onFocusPath,
   activeTypeFilter,
   onTypeFilterChange,
 }: ScanInsightsProps) {
-  const { largestDirectory, largestFile, recentLargeFile, staleLargeFile, topTypes } =
-    useMemo(() => buildInsights(files, sizeMode), [files, sizeMode]);
+  const cards = toCards(insights);
 
-  const insightItems = [
-    toInsightItem(largestDirectory, sizeMode, "最大目录", "先从体积最大的目录开始排查"),
-    toInsightItem(largestFile, sizeMode, "最大文件", "单文件往往是最直接的清理入口"),
-    toInsightItem(recentLargeFile, sizeMode, "近期新增的大文件", "最近 30 天内变大的内容值得优先确认"),
-    toInsightItem(staleLargeFile, sizeMode, "长期未动的大文件", "超过 180 天未修改的文件更适合清理或归档"),
-  ].filter((item): item is InsightItem => item !== null);
-
-  if (insightItems.length === 0 && topTypes.length === 0) {
+  if (cards.length === 0 && insights.topTypes.length === 0) {
     return null;
   }
 
@@ -152,7 +82,7 @@ export default function ScanInsights({
               扫描洞察
             </h2>
             <p className="mt-1 text-sm text-gray-500">
-              基于当前展示结果生成，帮助你更快判断空间主要被什么占用。
+              基于完整索引计算，帮助你更快判断空间主要被什么占用。
             </p>
           </div>
           <div className="text-xs text-gray-400">
@@ -162,9 +92,9 @@ export default function ScanInsights({
       </div>
 
       <div className="space-y-6 px-6 py-5">
-        {insightItems.length > 0 && (
+        {cards.length > 0 && (
           <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
-            {insightItems.map((item, index) => {
+            {cards.map((card, index) => {
               const Icon =
                 index === 0
                   ? FolderTree
@@ -173,32 +103,32 @@ export default function ScanInsights({
                     : index === 2
                       ? AppWindow
                       : Clock3;
-
+              const size = sizeMode === "disk" ? card.pick.sizeDisk : card.pick.sizeLogical;
               return (
                 <button
-                  key={`${item.title}:${item.path}`}
+                  key={`${card.title}:${card.pick.path}`}
                   type="button"
-                  onClick={() => onFocusPath(item.path)}
+                  onClick={() => onFocusPath(card.pick.path)}
                   className="rounded-lg border border-gray-200 bg-white p-4 text-left transition-colors hover:border-blue-300 hover:bg-blue-50/50"
                 >
                   <div className="flex items-start justify-between gap-3">
                     <div className="min-w-0">
                       <div className="text-xs font-medium uppercase tracking-wider text-gray-500">
-                        {item.title}
+                        {card.title}
                       </div>
                       <div className="mt-2 truncate text-sm font-semibold text-gray-900">
-                        {item.path.split("/").filter(Boolean).pop() || item.path}
+                        {card.pick.path.split("/").filter(Boolean).pop() || card.pick.path}
                       </div>
                       <div className="mt-1 truncate text-xs text-gray-500">
-                        {item.path}
+                        {card.pick.path}
                       </div>
                     </div>
                     <Icon className="h-5 w-5 flex-shrink-0 text-blue-600" />
                   </div>
                   <div className="mt-3 flex items-center justify-between gap-3">
-                    <div className="text-sm text-gray-500">{item.description}</div>
+                    <div className="text-sm text-gray-500">{card.description}</div>
                     <div className="text-sm font-semibold text-gray-900">
-                      {formatFileSize(item.size)}
+                      {formatFileSize(size)}
                     </div>
                   </div>
                 </button>
@@ -207,7 +137,7 @@ export default function ScanInsights({
           </div>
         )}
 
-        {topTypes.length > 0 && (
+        {insights.topTypes.length > 0 && (
           <div>
             <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-gray-900">
               <Archive className="h-4 w-4 text-gray-500" />
@@ -227,49 +157,52 @@ export default function ScanInsights({
               </button>
               {activeTypeFilter && (
                 <div className="text-xs text-gray-500">
-                  当前仅查看: {activeTypeFilter}
+                  当前平铺视图仅查看: {activeTypeFilter}
                 </div>
               )}
             </div>
             <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
-              {topTypes.map((bucket) => (
-                <div
-                  key={bucket.label}
-                  className={`rounded-lg border px-4 py-3 transition-colors ${
-                    activeTypeFilter === bucket.label
-                      ? "border-blue-300 bg-blue-50/60"
-                      : "border-gray-200 bg-gray-50"
-                  }`}
-                >
-                  <div className="flex items-center justify-between gap-4">
-                    <div className="min-w-0">
-                      <div className="text-sm font-medium text-gray-900">{bucket.label}</div>
-                      <div className="mt-1 text-xs text-gray-500">
-                        {bucket.count.toLocaleString()} 个项目
+              {insights.topTypes.map((bucket) => {
+                const total = sizeMode === "disk" ? bucket.totalDisk : bucket.totalLogical;
+                return (
+                  <div
+                    key={bucket.label}
+                    className={`rounded-lg border px-4 py-3 transition-colors ${
+                      activeTypeFilter === bucket.label
+                        ? "border-blue-300 bg-blue-50/60"
+                        : "border-gray-200 bg-gray-50"
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-4">
+                      <div className="min-w-0">
+                        <div className="text-sm font-medium text-gray-900">{bucket.label}</div>
+                        <div className="mt-1 text-xs text-gray-500">
+                          {bucket.count.toLocaleString()} 个项目
+                        </div>
+                      </div>
+                      <div className="text-sm font-semibold text-gray-900">
+                        {formatFileSize(total)}
                       </div>
                     </div>
-                    <div className="text-sm font-semibold text-gray-900">
-                      {formatFileSize(bucket.totalSize)}
+                    <div className="mt-3 flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => onTypeFilterChange(bucket.label)}
+                        className="rounded-md border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-700 transition-colors hover:border-blue-200 hover:text-blue-700"
+                      >
+                        {activeTypeFilter === bucket.label ? "保持筛选" : "只看这类"}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => onFocusPath(bucket.samplePath)}
+                        className="rounded-md border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-700 transition-colors hover:border-blue-200 hover:text-blue-700"
+                      >
+                        定位示例
+                      </button>
                     </div>
                   </div>
-                  <div className="mt-3 flex items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={() => onTypeFilterChange(bucket.label)}
-                      className="rounded-md border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-700 transition-colors hover:border-blue-200 hover:text-blue-700"
-                    >
-                      {activeTypeFilter === bucket.label ? "保持筛选" : "只看这类"}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => onFocusPath(bucket.samplePath)}
-                      className="rounded-md border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-700 transition-colors hover:border-blue-200 hover:text-blue-700"
-                    >
-                      定位示例
-                    </button>
-                  </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         )}

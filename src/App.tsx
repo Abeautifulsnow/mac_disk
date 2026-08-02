@@ -1,74 +1,61 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
+  AlertTriangle,
   CheckCircle,
-  Filter,
-  FolderOpen,
   HardDrive,
   Loader2,
   XCircle,
 } from "lucide-react";
-import { startTransition, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { deletePath } from "./scanApi";
 import ConfirmDialog from "./components/ConfirmDialog";
 import FileList from "./components/FileList";
 import ScanInsights from "./components/ScanInsights";
 import Scanner from "./components/Scanner";
-import { categorizeFile } from "./scanInsights";
-import type { FileInfo, ScanEvent, ScanProgress } from "./types";
-
-function sortBySize(
-  items: FileInfo[],
-  mode: "logical" | "disk",
-): FileInfo[] {
-  return [...items].sort((a, b) => {
-    const aSize = mode === "disk" ? a.sizeDisk : a.sizeLogical;
-    const bSize = mode === "disk" ? b.sizeDisk : b.sizeLogical;
-    return bSize - aSize || a.path.localeCompare(b.path);
-  });
-}
+import type {
+  FileInfo,
+  Insights,
+  ScanCoverage,
+  ScanEvent,
+  ScanProgress,
+} from "./types";
 
 function App() {
-  const [files, setFiles] = useState<FileInfo[]>([]);
+  const [scanId, setScanId] = useState<string | null>(null);
+  const [scanRoot, setScanRoot] = useState("/Users");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [cancelPending, setCancelPending] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<FileInfo | null>(null);
-  const [currentScanId, setCurrentScanId] = useState<string | null>(null);
   const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null);
   const [scanStats, setScanStats] = useState<{
     filesFound: number;
     directoriesFound: number;
-    resultCount: number;
     totalSizeLogical: number;
     totalSizeDisk: number;
+    physicalUniqueTotal: number;
   } | null>(null);
+  const [scanCoverage, setScanCoverage] = useState<ScanCoverage | null>(null);
+  const [insights, setInsights] = useState<Insights | null>(null);
+  const [previewItems, setPreviewItems] = useState<FileInfo[]>([]);
   const [terminalState, setTerminalState] = useState<"timeout" | null>(null);
   const [lastTimeoutSeconds, setLastTimeoutSeconds] = useState<number>(300);
   const [sizeMode, setSizeMode] = useState<"logical" | "disk">("logical");
-  const [scanRoot, setScanRoot] = useState("/Users");
-  const [listSessionKey, setListSessionKey] = useState(0);
   const [focusedResultPath, setFocusedResultPath] = useState<string | null>(null);
   const [activeTypeFilter, setActiveTypeFilter] = useState<string | null>(null);
+  const [listVersion, setListVersion] = useState(0);
 
-  // 使用 ref 来跟踪最新的 currentScanId，避免闭包问题
   const currentScanIdRef = useRef<string | null>(null);
   const loadingRef = useRef(false);
   const terminalStateRef = useRef<"timeout" | null>(null);
-  const scanSizeModeRef = useRef<"logical" | "disk">("logical");
-  const previewQueueRef = useRef<Map<string, FileInfo>>(new Map());
+  const previewMapRef = useRef<Map<string, FileInfo>>(new Map());
   const previewFlushTimerRef = useRef<number | null>(null);
-  const previewSessionRef = useRef(0);
-  const lastScanOptionsRef = useRef({
-    limit: 50,
-    minSize: 10,
-    timeoutSeconds: 300,
-  });
 
-  // 同步 ref 和 state
   useEffect(() => {
-    currentScanIdRef.current = currentScanId;
-  }, [currentScanId]);
+    currentScanIdRef.current = scanId;
+  }, [scanId]);
   useEffect(() => {
     terminalStateRef.current = terminalState;
   }, [terminalState]);
@@ -85,42 +72,35 @@ function App() {
     };
   }, []);
 
-  const clearPreviewQueue = () => {
-    previewSessionRef.current += 1;
-    previewQueueRef.current.clear();
+  const clearPreview = () => {
+    previewMapRef.current.clear();
     if (previewFlushTimerRef.current !== null) {
       window.clearTimeout(previewFlushTimerRef.current);
       previewFlushTimerRef.current = null;
     }
+    setPreviewItems([]);
   };
 
   const schedulePreviewFlush = () => {
     if (previewFlushTimerRef.current !== null) return;
-
-    const sessionAtSchedule = previewSessionRef.current;
     previewFlushTimerRef.current = window.setTimeout(() => {
       previewFlushTimerRef.current = null;
-
-      if (sessionAtSchedule !== previewSessionRef.current) return;
       if (!loadingRef.current) return;
-
-      const previewItems = Array.from(previewQueueRef.current.values());
-      startTransition(() => {
-        setFiles(sortBySize(previewItems, scanSizeModeRef.current));
-      });
-    }, 120);
+      setPreviewItems(Array.from(previewMapRef.current.values()));
+    }, 150);
   };
 
-  const isEventForActiveScan = (scanId: string) => {
-    const activeScanId = currentScanIdRef.current;
-    if (activeScanId) {
-      return scanId === activeScanId;
-    }
+  const addPreviewItem = (item: FileInfo) => {
+    previewMapRef.current.set(item.path, item);
+    schedulePreviewFlush();
+  };
 
+  const isEventForActiveScan = (eventScanId: string) => {
+    const activeScanId = currentScanIdRef.current;
+    if (activeScanId) return eventScanId === activeScanId;
     return loadingRef.current;
   };
 
-  // 监听扫描事件 - 使用 useRef 来获取最新的 currentScanId
   useEffect(() => {
     let unlisten: (() => void) | undefined;
 
@@ -128,22 +108,10 @@ function App() {
       try {
         unlisten = await listen<ScanEvent>("scan-event", (event) => {
           const payload = event.payload;
-          console.log("收到扫描事件:", payload.type, "scanId:", payload.scanId);
-
-          if (!isEventForActiveScan(payload.scanId)) {
-            return;
-          }
+          if (!isEventForActiveScan(payload.scanId)) return;
 
           switch (payload.type) {
             case "progress":
-              console.log(
-                "收到进度事件，scanId:",
-                payload.scanId,
-                "已处理:",
-                payload.processed,
-                "总数:",
-                payload.totalEstimated,
-              );
               setScanProgress({
                 scanId: payload.scanId,
                 processed: payload.processed,
@@ -159,145 +127,81 @@ function App() {
               break;
 
             case "fileFound":
-              previewQueueRef.current.set(payload.file.path, payload.file);
-              schedulePreviewFlush();
+              addPreviewItem(payload.file);
               break;
 
             case "directoryFound":
-              previewQueueRef.current.set(payload.directory.path, payload.directory);
-              schedulePreviewFlush();
+              addPreviewItem(payload.directory);
               break;
 
             case "completed":
-              console.log(
-                "收到完成事件，scanId:",
-                payload.scanId,
-                "文件:",
-                payload.filesFound,
-                "目录:",
-                payload.directoriesFound,
-              );
-              const resultsForStats = payload.results ?? [];
-              const derivedFilesFound = resultsForStats.filter(
-                (x) => !x.is_dir,
-              ).length;
-              const derivedDirectoriesFound = resultsForStats.filter(
-                (x) => x.is_dir,
-              ).length;
-              const derivedTotalSizeLogical = resultsForStats
-                .filter((x) => !x.is_dir)
-                .reduce((s, x) => s + x.sizeLogical, 0);
-              const derivedTotalSizeDisk = resultsForStats
-                .filter((x) => !x.is_dir)
-                .reduce((s, x) => s + x.sizeDisk, 0);
-              const fallbackTotalSize =
-                scanSizeModeRef.current === "disk"
-                  ? derivedTotalSizeDisk
-                  : derivedTotalSizeLogical;
-              clearPreviewQueue();
+              clearPreview();
               setScanStats({
-                filesFound: Number(
-                  payload.filesFound ?? derivedFilesFound ?? 0,
-                ),
-                directoriesFound: Number(
-                  payload.directoriesFound ?? derivedDirectoriesFound ?? 0,
-                ),
-                resultCount: Number(
-                  payload.resultCount ?? resultsForStats.length ?? 0,
-                ),
-                totalSizeLogical: Number(
-                  payload.totalSizeLogical ??
-                    (scanSizeModeRef.current === "logical"
-                      ? payload.totalSize
-                      : undefined) ??
-                    fallbackTotalSize ??
-                    0,
-                ),
-                totalSizeDisk: Number(
-                  payload.totalSizeDisk ??
-                    (scanSizeModeRef.current === "disk"
-                      ? payload.totalSize
-                      : undefined) ??
-                    fallbackTotalSize ??
-                    0,
-                ),
+                filesFound: Number(payload.filesFound ?? 0),
+                directoriesFound: Number(payload.directoriesFound ?? 0),
+                totalSizeLogical: Number(payload.totalSizeLogical ?? 0),
+                totalSizeDisk: Number(payload.totalSizeDisk ?? 0),
+                physicalUniqueTotal: Number(payload.physicalUniqueTotal ?? 0),
               });
-              // 一次性更新所有结果
-              setFiles(payload.results);
+              setScanCoverage(payload.scanCoverage);
+              setInsights(payload.insights);
               setLoading(false);
               setCancelPending(false);
-              setCurrentScanId(null);
-              currentScanIdRef.current = null;
+              setScanId(null);
               setScanProgress(null);
               setTerminalState(null);
+              setListVersion((current) => current + 1);
               break;
 
-            case "cancelled":
-              // 使用 ref 获取最新的 currentScanId，避免闭包问题
+            case "cancelled": {
               const latestScanId = currentScanIdRef.current;
-              console.log(
-                "收到取消事件，scanId:",
-                payload.scanId,
-                "当前scanId:",
-                latestScanId,
-              );
-              // 只有当事件的 scanId 匹配当前扫描时才处理
               if (payload.scanId === latestScanId || latestScanId === null) {
-                if (terminalStateRef.current !== "timeout") {
-                  setError(null);
-                }
+                if (terminalStateRef.current !== "timeout") setError(null);
                 setLoading(false);
                 setCancelPending(false);
-                setCurrentScanId(null);
+                setScanId(null);
                 currentScanIdRef.current = null;
                 setScanProgress(null);
                 setScanStats(null);
-                clearPreviewQueue();
-                setFiles([]);
+                setScanCoverage(null);
+                setInsights(null);
+                clearPreview();
               }
               break;
+            }
 
-            case "timeout":
+            case "timeout": {
               const timeoutScanId = currentScanIdRef.current;
-              console.log(
-                "收到超时事件，scanId:",
-                payload.scanId,
-                "当前scanId:",
-                timeoutScanId,
-              );
               if (payload.scanId === timeoutScanId || timeoutScanId === null) {
                 setError(
-                  `扫描超时 (${lastTimeoutSeconds}秒)，请尝试扫描较小的目录或增加限制。`,
+                  `扫描超时 (${lastTimeoutSeconds}秒)，请尝试扫描较小的目录或增加超时时间。`,
                 );
                 setLoading(false);
                 setCancelPending(false);
-                setCurrentScanId(null);
+                setScanId(null);
                 currentScanIdRef.current = null;
                 setScanProgress(null);
                 setTerminalState("timeout");
                 setScanStats(null);
-                clearPreviewQueue();
-                setFiles([]);
+                setScanCoverage(null);
+                setInsights(null);
+                clearPreview();
               }
               break;
+            }
 
             case "error":
-              console.log(
-                "收到错误事件，scanId:",
-                payload.scanId,
-                "消息:",
-                payload.message,
-              );
               setError(payload.message);
               setLoading(false);
               setCancelPending(false);
-              setCurrentScanId(null);
+              setScanId(null);
               currentScanIdRef.current = null;
               setScanProgress(null);
               setTerminalState(null);
               setScanStats(null);
-              clearPreviewQueue();
-              setFiles([]);
+              setScanCoverage(null);
+              setInsights(null);
+              clearPreview();
               break;
           }
         });
@@ -309,110 +213,98 @@ function App() {
     setupListener();
 
     return () => {
-      if (unlisten) {
-        unlisten();
-      }
+      if (unlisten) unlisten();
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const handleScan = async (
-    path: string,
-    limit: number,
-    minSize: number,
-    timeoutSeconds: number,
-  ) => {
-    console.log("开始扫描，路径:", path, "限制:", limit, "最小大小:", minSize);
+  const handleScan = useCallback(async (path: string, timeoutSeconds: number) => {
     setLoading(true);
     setError(null);
     setCancelPending(false);
-    setFiles([]); // 清空之前的结果
     setScanProgress(null);
     setScanStats(null);
-    setTerminalState(null);
+    setScanCoverage(null);
+    setInsights(null);
     setFocusedResultPath(null);
     setActiveTypeFilter(null);
     setLastTimeoutSeconds(timeoutSeconds);
     setScanRoot(path);
-    setListSessionKey((current) => current + 1);
-    scanSizeModeRef.current = sizeMode;
-    lastScanOptionsRef.current = { limit, minSize, timeoutSeconds };
-    clearPreviewQueue();
+    setListVersion((current) => current + 1);
+    clearPreview();
     try {
-      // 使用新的带进度扫描命令
-      const scanId = await invoke<string>("scan_directory_with_progress", {
-        options: {
-          path,
-          limit: limit > 0 ? limit : null,
-          minSize: minSize > 0 ? minSize * 1024 * 1024 : null, // 转换为字节
-          timeoutSeconds: timeoutSeconds >= 0 ? timeoutSeconds : null,
-          sizeMode,
-        },
+      const newScanId = await invoke<string>("scan_directory_with_progress", {
+        options: { path, timeoutSeconds, sizeMode },
       });
-      console.log("扫描已启动，scanId:", scanId);
-      setCurrentScanId(scanId);
-      currentScanIdRef.current = scanId;
+      setScanId(newScanId);
+      currentScanIdRef.current = newScanId;
     } catch (err) {
       setError(err instanceof Error ? err.message : "启动扫描失败");
       console.error("扫描错误:", err);
       setLoading(false);
       setCancelPending(false);
-      clearPreviewQueue();
+      clearPreview();
     }
-  };
+  }, [sizeMode]);
 
   const handleCancelScan = async () => {
-    if (currentScanId && !cancelPending) {
-      console.log("点击取消扫描按钮，scanId:", currentScanId);
-      try {
-        setCancelPending(true);
-        const cancelled = await invoke<boolean>("cancel_scan", {
-          scanId: currentScanId,
-        });
-        console.log("取消扫描结果:", cancelled);
-        if (cancelled) {
-          // 设置超时，如果5秒内没有收到取消事件，强制重置状态
-          setTimeout(() => {
-            console.log(
-              "取消扫描超时，强制重置状态，当前scanId:",
-              currentScanIdRef.current,
-            );
-            // 检查是否已经收到取消事件
-            if (currentScanIdRef.current === null) {
-              console.log("已收到取消事件，无需强制重置");
-              return;
-            }
-            console.log("未收到取消事件，强制重置状态");
-            setError(null);
-            setCurrentScanId(null);
-            setScanProgress(null);
-            setLoading(false);
-            setCancelPending(false);
-            clearPreviewQueue();
-            currentScanIdRef.current = null;
-          }, 5000);
-        } else {
-          setError("扫描已结束或无法取消");
-          setCancelPending(false);
-        }
-      } catch (err) {
-        console.error("取消扫描失败:", err);
-        setError(
-          err instanceof Error
-            ? `取消扫描失败: ${err.message}`
-            : "取消扫描失败",
-        );
-        setLoading(false);
-        setCancelPending(false);
-        setCurrentScanId(null);
+    const activeScanId = currentScanIdRef.current;
+    if (!activeScanId || cancelPending) return;
+    try {
+      setCancelPending(true);
+      await invoke<boolean>("cancel_scan", { scanId: activeScanId });
+      setTimeout(() => {
+        if (currentScanIdRef.current === null) return;
+        setError(null);
+        setScanId(null);
         currentScanIdRef.current = null;
         setScanProgress(null);
-        clearPreviewQueue();
-      }
+        setLoading(false);
+        setCancelPending(false);
+        clearPreview();
+      }, 5000);
+    } catch (err) {
+      console.error("取消扫描失败:", err);
+      setError(err instanceof Error ? `取消扫描失败: ${err.message}` : "取消扫描失败");
+      setLoading(false);
+      setCancelPending(false);
+      setScanId(null);
+      currentScanIdRef.current = null;
+      setScanProgress(null);
+      clearPreview();
     }
   };
 
-  const handleDelete = async (file: FileInfo) => {
+  const handleDelete = (file: FileInfo) => {
     setConfirmDelete(file);
+  };
+
+  const confirmDeleteAction = async () => {
+    if (!confirmDelete) return;
+    const path = confirmDelete.path;
+    try {
+      const result = await deletePath(path, scanId);
+      setSuccess(result.message);
+      setTimeout(() => setSuccess(null), 3000);
+      if (result.updated) {
+        setScanStats({
+          filesFound: result.updated.filesScanned,
+          directoriesFound: result.updated.directoriesScanned,
+          totalSizeLogical: result.updated.totalSizeLogical,
+          totalSizeDisk: result.updated.totalSizeDisk,
+          physicalUniqueTotal: result.updated.physicalUniqueTotal,
+        });
+        setInsights(result.updated.insights);
+      }
+      setFocusedResultPath((current) => (current === path ? null : current));
+      // Force the list to reload from the backend so removed items don't reappear.
+      setListVersion((current) => current + 1);
+      setConfirmDelete(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "删除失败");
+      console.error("删除错误:", err);
+      setConfirmDelete(null);
+    }
   };
 
   const handleShowInFinder = async (file: FileInfo) => {
@@ -435,110 +327,27 @@ function App() {
 
   const handleRescanDirectory = (file: FileInfo) => {
     if (!file.is_dir) return;
-    const { limit, minSize, timeoutSeconds } = lastScanOptionsRef.current;
-    void handleScan(file.path, limit, minSize, timeoutSeconds);
+    void handleScan(file.path, lastTimeoutSeconds);
   };
 
-  const confirmDeleteAction = async () => {
-    if (!confirmDelete) return;
-
-    try {
-      const result = await invoke<string>("delete_path", {
-        path: confirmDelete.path,
-      });
-      // 先显示成功消息，再关闭确认框
-      setSuccess(result);
-      // 3秒后自动清除成功消息
-      setTimeout(() => setSuccess(null), 3000);
-
-      // 从列表中移除已删除的项目；目录删除后同步移除子项。
-      const deletedPathPrefix = confirmDelete.path.endsWith("/")
-        ? confirmDelete.path
-        : `${confirmDelete.path}/`;
-      const removedItems = files.filter(
-        (f) =>
-          f.path === confirmDelete.path ||
-          (confirmDelete.is_dir && f.path.startsWith(deletedPathPrefix)),
-      );
-      setFiles((currentFiles) =>
-        currentFiles.filter(
-          (f) =>
-            f.path !== confirmDelete.path &&
-            (!confirmDelete.is_dir || !f.path.startsWith(deletedPathPrefix)),
-        ),
-      );
-      setFocusedResultPath((current) =>
-        current === confirmDelete.path ? null : current,
-      );
-      setActiveTypeFilter((current) => {
-        if (!current) return current;
-        return removedItems.some((item) => categorizeFile(item) === current)
-          ? current
-          : current;
-      });
-      setScanStats((currentStats) => {
-        if (!currentStats) return currentStats;
-
-        return {
-          ...currentStats,
-          filesFound: Math.max(
-            0,
-            currentStats.filesFound -
-              removedItems.filter((item) => !item.is_dir).length,
-          ),
-          directoriesFound: Math.max(
-            0,
-            currentStats.directoriesFound -
-              removedItems.filter((item) => item.is_dir).length,
-          ),
-          resultCount: Math.max(0, currentStats.resultCount - removedItems.length),
-          totalSizeLogical: Math.max(
-            0,
-            currentStats.totalSizeLogical - confirmDelete.sizeLogical,
-          ),
-          totalSizeDisk: Math.max(
-            0,
-            currentStats.totalSizeDisk - confirmDelete.sizeDisk,
-          ),
-        };
-      });
-      // 最后关闭确认对话框
-      setConfirmDelete(null);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "删除失败");
-      console.error("删除错误:", err);
-      // 删除失败也要关闭确认对话框
-      setConfirmDelete(null);
-    }
+  const handleRescanRoot = () => {
+    void handleScan(scanRoot, lastTimeoutSeconds);
   };
 
   const formatFileSize = (bytes: number): string => {
     const units = ["B", "KB", "MB", "GB", "TB"];
     let size = bytes;
     let unitIndex = 0;
-
     while (size >= 1000 && unitIndex < units.length - 1) {
       size /= 1000;
       unitIndex++;
     }
-
     return `${size.toFixed(2)} ${units[unitIndex]}`;
   };
 
-  const headerTotalSize = scanStats
-    ? sizeMode === "disk"
-      ? scanStats.totalSizeDisk
-      : scanStats.totalSizeLogical
-    : 0;
-  const totalItems =
-    (scanStats?.filesFound ?? 0) + (scanStats?.directoriesFound ?? 0);
-  const isPreviewResults = loading && files.length > 0;
-  const previewItemCount = files.length;
-  const displayedFiles = useMemo(() => {
-    if (!activeTypeFilter) return files;
-    return files.filter((file) => categorizeFile(file) === activeTypeFilter);
-  }, [activeTypeFilter, files]);
-  const displayedItemCount = displayedFiles.length;
+  const headerTotalSize =
+    scanStats && (sizeMode === "disk" ? scanStats.totalSizeDisk : scanStats.totalSizeLogical);
+  const isPreviewResults = loading && previewItems.length > 0;
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -558,40 +367,33 @@ function App() {
               <>
                 <div className="text-sm text-gray-500 leading-tight">
                   已扫描总大小:{" "}
-                  <span className="font-semibold">
-                    {formatFileSize(headerTotalSize)}
-                  </span>
+                  <span className="font-semibold">{formatFileSize(headerTotalSize ?? 0)}</span>
                 </div>
                 <div className="text-xs text-gray-400 leading-tight">
                   统计口径: {sizeMode === "disk" ? "磁盘使用量" : "逻辑大小"}
                 </div>
                 <div className="text-xs text-gray-400 leading-tight">
-                  符合条件: 文件 {scanStats.filesFound.toLocaleString()} | 目录{" "}
+                  文件 {scanStats.filesFound.toLocaleString()} | 目录{" "}
                   {scanStats.directoriesFound.toLocaleString()}
                 </div>
-                <div className="text-xs text-gray-400 leading-tight">
-                  当前展示: {scanStats.resultCount.toLocaleString()} /{" "}
-                  {totalItems.toLocaleString()} 个项目
-                </div>
-                {activeTypeFilter && (
-                  <div className="text-xs text-blue-600 leading-tight">
-                    已筛选类型: {activeTypeFilter} ({displayedItemCount.toLocaleString()} 项)
+                {scanCoverage?.partial && (
+                  <div className="flex items-center gap-1 text-xs text-amber-700 leading-tight font-medium">
+                    <AlertTriangle className="h-3.5 w-3.5 flex-shrink-0" />
+                    部分扫描完成（{scanCoverage.unscannedRegions.length} 个区域不可访问）
                   </div>
                 )}
               </>
             ) : isPreviewResults ? (
               <>
                 <div className="text-sm text-amber-700 leading-tight font-medium">
-                  扫描中预览: {previewItemCount.toLocaleString()} 个项目
+                  扫描中预览: {previewItems.length.toLocaleString()} 个项目
                 </div>
                 <div className="text-xs text-amber-600 leading-tight">
-                  列表仍在变化，完成后会切换为最终结果
+                  列表仍在变化，完成后切换为完整结果
                 </div>
               </>
             ) : (
-              <div className="text-xs text-gray-400 leading-tight">
-                等待扫描
-              </div>
+              <div className="text-xs text-gray-400 leading-tight">等待扫描</div>
             )}
           </div>
         </div>
@@ -606,7 +408,7 @@ function App() {
               loading={loading}
               cancelPending={cancelPending}
               progress={scanProgress}
-              canCancel={!!currentScanId}
+              canCancel={!!currentScanIdRef.current}
               sizeMode={sizeMode}
               onSizeModeChange={setSizeMode}
             />
@@ -627,63 +429,70 @@ function App() {
               </div>
             )}
 
-            {loading && files.length === 0 ? (
-              <div className="flex flex-col items-center justify-center py-12">
+            {scanCoverage?.partial && scanStats && !loading && (
+              <div className="mb-4 p-4 bg-amber-50 border border-amber-200 rounded-lg">
+                <div className="flex items-start space-x-3">
+                  <AlertTriangle className="h-5 w-5 text-amber-600 flex-shrink-0 mt-0.5" />
+                  <div className="text-amber-800 text-sm">
+                    <div className="font-medium">部分扫描完成</div>
+                    <div className="mt-1">
+                      {scanCoverage.unscannedRegions.length} 个区域因权限或 I/O 错误未完整扫描，
+                      统计与洞察仅覆盖可访问的部分。
+                    </div>
+                    <details className="mt-2">
+                      <summary className="cursor-pointer text-amber-700 hover:text-amber-900">
+                        查看不可访问区域
+                      </summary>
+                      <ul className="mt-2 max-h-40 overflow-auto space-y-1 font-mono text-xs">
+                        {scanCoverage.unscannedRegions.map((region) => (
+                          <li key={region.path} className="truncate">
+                            {region.path} <span className="text-amber-600">[{region.reason}]</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </details>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {insights && scanStats && !loading && (
+              <ScanInsights
+                insights={insights}
+                sizeMode={sizeMode}
+                formatFileSize={formatFileSize}
+                onFocusPath={setFocusedResultPath}
+                activeTypeFilter={activeTypeFilter}
+                onTypeFilterChange={setActiveTypeFilter}
+              />
+            )}
+
+            {loading && previewItems.length === 0 && !scanStats ? (
+              <div className="flex flex-col items-center justify-center py-12 bg-white rounded-xl border border-gray-200">
                 <Loader2 className="h-12 w-12 text-blue-600 animate-spin mb-4" />
                 <p className="text-gray-600">正在扫描磁盘，请稍候...</p>
                 <p className="text-sm text-gray-500 mt-2">
-                  这可能需要一些时间，具体取决于目录大小
+                  这会保留全部文件记录，可能需要一些时间
                 </p>
               </div>
-            ) : files.length > 0 ? (
-              <>
-                {!isPreviewResults && (
-                  <ScanInsights
-                    files={files}
-                    sizeMode={sizeMode}
-                    formatFileSize={formatFileSize}
-                    onFocusPath={setFocusedResultPath}
-                    activeTypeFilter={activeTypeFilter}
-                    onTypeFilterChange={setActiveTypeFilter}
-                  />
-                )}
-                {activeTypeFilter && (
-                  <div className="mb-4 flex items-center justify-between rounded-lg border border-blue-200 bg-blue-50 px-4 py-3">
-                    <div className="flex items-center gap-2 text-sm text-blue-800">
-                      <Filter className="h-4 w-4" />
-                      当前仅显示类型: {activeTypeFilter}
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => setActiveTypeFilter(null)}
-                      className="rounded-md border border-blue-200 bg-white px-3 py-1.5 text-xs font-medium text-blue-700 transition-colors hover:bg-blue-100"
-                    >
-                      清除筛选
-                    </button>
-                  </div>
-                )}
-                <FileList
-                  files={displayedFiles}
-                  sessionKey={listSessionKey}
-                  scanRoot={scanRoot}
-                  isPreview={isPreviewResults}
-                  focusedPath={focusedResultPath}
-                  onDelete={handleDelete}
-                  onShowInFinder={handleShowInFinder}
-                  onCopyPath={handleCopyPath}
-                  onRescanDirectory={handleRescanDirectory}
-                  formatFileSize={formatFileSize}
-                  sizeMode={sizeMode}
-                />
-              </>
             ) : (
-              <div className="text-center py-12">
-                <FolderOpen className="h-16 w-16 text-gray-300 mx-auto mb-4" />
-                <h3 className="text-lg font-medium text-gray-900 mb-2">
-                  暂无扫描结果
-                </h3>
-                <p className="text-gray-500">选择一个目录开始扫描</p>
-              </div>
+              <FileList
+                scanId={scanId}
+                scanRoot={scanRoot}
+                isPreview={isPreviewResults}
+                previewItems={previewItems}
+                sizeMode={sizeMode}
+                activeTypeFilter={activeTypeFilter}
+                onTypeFilterChange={setActiveTypeFilter}
+                onDelete={handleDelete}
+                onShowInFinder={handleShowInFinder}
+                onCopyPath={handleCopyPath}
+                onRescanDirectory={handleRescanDirectory}
+                onRescanRoot={handleRescanRoot}
+                formatFileSize={formatFileSize}
+                focusedPath={focusedResultPath}
+                listVersion={listVersion}
+              />
             )}
           </div>
         </div>

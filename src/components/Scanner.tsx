@@ -5,7 +5,7 @@ import { FolderOpen, Scan, Settings, AlertCircle, Loader2 } from 'lucide-react'
 import type { ScanProgress } from '../types'
 
 interface ScannerProps {
-  onScan: (path: string, limit: number, minSize: number, timeoutSeconds: number) => void
+  onScan: (path: string, timeoutSeconds: number) => void
   onCancel?: () => void
   loading: boolean
   cancelPending?: boolean
@@ -17,8 +17,6 @@ interface ScannerProps {
 
 export default function Scanner({ onScan, onCancel, loading, cancelPending = false, progress, canCancel = false, sizeMode, onSizeModeChange }: ScannerProps) {
   const [path, setPath] = useState('/Users')
-  const [limit, setLimit] = useState(50)
-  const [minSize, setMinSize] = useState(10) // MB
   const [timeoutSeconds, setTimeoutSeconds] = useState(300)
   const [dialogError, setDialogError] = useState<string | null>(null)
   const [startedAt, setStartedAt] = useState<number | null>(null)
@@ -77,7 +75,7 @@ export default function Scanner({ onScan, onCancel, loading, cancelPending = fal
 
   const handleScan = () => {
     if (path.trim()) {
-      onScan(path, limit, minSize, timeoutSeconds)
+      onScan(path, timeoutSeconds)
     }
   }
 
@@ -122,50 +120,6 @@ export default function Scanner({ onScan, onCancel, loading, cancelPending = fal
               <p className="text-xs text-red-700">{dialogError}</p>
             </div>
           )}
-        </div>
-
-        <div className="grid grid-cols-2 gap-4">
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-2">
-              显示数量限制
-            </label>
-            <div className="flex items-center space-x-2">
-              <input
-                type="range"
-                min="10"
-                max="200"
-                step="10"
-                value={limit}
-                onChange={(e) => setLimit(parseInt(e.target.value))}
-                className="flex-1"
-              />
-              <span className="text-sm font-medium text-gray-900 w-12">{limit}</span>
-            </div>
-            <p className="mt-1 text-xs text-gray-500">
-              限制显示的项目数量，提高性能
-            </p>
-          </div>
-
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-2">
-              最小文件大小 (MB)
-            </label>
-            <div className="flex items-center space-x-2">
-              <input
-                type="range"
-                min="1"
-                max="1000"
-                step="10"
-                value={minSize}
-                onChange={(e) => setMinSize(parseInt(e.target.value))}
-                className="flex-1"
-              />
-              <span className="text-sm font-medium text-gray-900 w-16">{minSize} MB</span>
-            </div>
-            <p className="mt-1 text-xs text-gray-500">
-              只显示大于此大小的文件和目录
-            </p>
-          </div>
         </div>
 
         <div>
@@ -271,23 +225,19 @@ export default function Scanner({ onScan, onCancel, loading, cancelPending = fal
                   )}
                 </div>
               )}
-              
+
               <div className="relative w-full bg-gray-100 rounded-full h-2.5 overflow-hidden">
-                {/* 背景动画条 (当没有精确进度时显示) */}
                 {(!progress || !progress.percentage) && (
                   <div className="absolute inset-0 bg-gray-200 animate-pulse"></div>
                 )}
-                
-                {/* 实际进度条 */}
                 <div
                   className="bg-blue-600 h-2.5 rounded-full transition-all duration-300 ease-out flex items-center justify-end relative"
                   style={{ width: progress?.percentage ? `${Math.min(progress.percentage, 100)}%` : '0%' }}
                 >
-                  {/* 进度条光效 */}
                   <div className="absolute top-0 bottom-0 right-0 w-4 bg-white/30 skew-x-[-20deg]"></div>
                 </div>
               </div>
-              
+
               <div className="text-xs text-gray-500 truncate font-mono h-4" title={progress?.currentPath}>
                 {progress?.currentPath ? `扫描: ${progress.currentPath}` : '正在初始化扫描引擎...'}
               </div>
@@ -316,9 +266,9 @@ export default function Scanner({ onScan, onCancel, loading, cancelPending = fal
           <h4 className="text-sm font-medium text-blue-800 mb-2">扫描提示</h4>
           <ul className="text-xs text-blue-700 space-y-1">
             <li>• 避免扫描系统根目录，选择用户目录进行扫描</li>
-            <li>• 设置最小文件大小可过滤小文件，提高性能</li>
+            <li>• 扫描会保留全部文件记录，大小筛选在平铺视图中进行</li>
             <li>• 扫描大目录时请耐心等待</li>
-            <li>• 删除操作需要二次确认，请谨慎操作</li>
+            <li>• 删除操作移入废纸篓，可恢复；清空废纸篓后不可恢复</li>
           </ul>
         </div>
       </div>

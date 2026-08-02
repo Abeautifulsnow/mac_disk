@@ -1,5 +1,6 @@
 use crate::commands::{FileInfo, ScanEvent};
-use std::collections::HashMap;
+use crate::index::{normalize_path, ScanCoverage, ScanIndex, UnscannedRegion};
+use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,101 +8,31 @@ use std::sync::Arc;
 use std::time::{Instant, UNIX_EPOCH};
 use walkdir::WalkDir;
 
-/// 性能指标收集结构
-#[derive(Debug, Default)]
-struct PerformanceMetrics {
-    start_time: Option<Instant>,
-    end_time: Option<Instant>,
-    total_entries: usize,
-    files_processed: usize,
-    dirs_processed: usize,
-    skipped_entries: usize,
-    metadata_read_time: u128, // 纳秒
-    dir_calc_time: u128,      // 纳秒
-    sorting_time: u128,       // 纳秒
-}
+/// Upper bound on the number of live preview events emitted during a scan.
+const PREVIEW_EVENT_CAP: usize = 200;
+/// Only files at least this large are emitted as live previews (avoids flooding).
+const PREVIEW_MIN_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
 
-impl PerformanceMetrics {
-    fn new() -> Self {
-        Self {
-            start_time: Some(Instant::now()),
-            ..Default::default()
-        }
-    }
-
-    fn finish(&mut self) {
-        self.end_time = Some(Instant::now());
-    }
-
-    fn log_summary(&self) {
-        if let (Some(start), Some(end)) = (self.start_time, self.end_time) {
-            let total_time = end.duration_since(start).as_millis();
-            tracing::info!(
-                "性能指标 - 总耗时: {}ms, 处理条目: {}, 文件: {}, 目录: {}, 跳过: {}, 元数据读取: {}ms, 目录计算: {}ms, 排序: {}ms",
-                total_time,
-                self.total_entries,
-                self.files_processed,
-                self.dirs_processed,
-                self.skipped_entries,
-                self.metadata_read_time / 1_000_000,
-                self.dir_calc_time / 1_000_000,
-                self.sorting_time / 1_000_000
-            );
-        }
-    }
-}
-
-/// 扫描目录并返回占用空间最大的文件和目录
-/// 这是一个简单的包装器，用于非Tauri环境或不需要进度的场景
-pub fn scan_directory(
-    root: &Path,
-    limit: Option<usize>,
-    min_size: Option<u64>,
-    size_mode: Option<&str>,
-) -> Result<Vec<FileInfo>, Box<dyn std::error::Error>> {
-    let cancel_flag = Arc::new(AtomicBool::new(false));
-    let (files, dirs, _) = scan_directory_with_progress(
-        root,
-        limit,
-        min_size,
-        cancel_flag,
-        "internal".to_string(),
-        size_mode,
-        |_| Ok(()),
-    )?;
-
-    let mut result = files;
-    result.extend(dirs);
-    // 这里不再重新排序，因为 scan_directory_with_progress 已经排好了
-    // 但合并后可能需要再次截断，这里简单处理直接返回
-    Ok(result)
-}
-
-/// 并行扫描目录（保留接口兼容性）
-pub fn scan_directory_parallel(
-    root: &Path,
-    limit: Option<usize>,
-    min_size: Option<u64>,
-    size_mode: Option<&str>,
-) -> Result<Vec<FileInfo>, Box<dyn std::error::Error>> {
-    scan_directory(root, limit, min_size, size_mode)
-}
-
-/// 带进度跟踪和取消支持的目录扫描（高性能重构版）
+/// Build a complete scan index for `root`, emitting progress and bounded live
+/// preview events through `progress_callback`. The `Completed` event is emitted
+/// by the caller after the index is stored, so queries never race it.
 pub fn scan_directory_with_progress<F>(
     root: &Path,
-    limit: Option<usize>,
-    min_size: Option<u64>,
     cancel_flag: Arc<AtomicBool>,
     scan_id: String,
-    size_mode: Option<&str>,
     mut progress_callback: F,
-) -> Result<(Vec<FileInfo>, Vec<FileInfo>, u64), Box<dyn std::error::Error>>
+) -> Result<(ScanIndex, ScanCoverage), Box<dyn std::error::Error>>
 where
     F: FnMut(ScanEvent) -> Result<(), Box<dyn std::error::Error>>,
 {
-    let mut metrics = PerformanceMetrics::new();
-    tracing::info!("[{}] 开始高性能扫描: {}", scan_id, root.display());
+    let mut index = ScanIndex::new(root);
+    let mut unscanned_regions: Vec<UnscannedRegion> = Vec::new();
+    let mut seen_inodes: HashSet<(u32, u64)> = HashSet::new();
+    let mut dir_agg: HashMap<PathBuf, (u64, u64)> = HashMap::new();
+    let mut preview_dirs_sent: HashMap<String, (u64, u64)> = HashMap::new();
+    let mut preview_events_emitted = 0usize;
+    let mut scanned_entries = 0usize;
+    let mut last_progress_emit = Instant::now();
 
     progress_callback(ScanEvent::Progress {
         scan_id: scan_id.clone(),
@@ -112,24 +43,6 @@ where
         phase: Some("walking".to_string()),
     })?;
 
-    if cancel_flag.load(Ordering::SeqCst) {
-        return Err("扫描被取消".into());
-    }
-
-    tracing::info!("[{}] 开始流式遍历目录...", scan_id);
-    let mut dir_sizes: HashMap<PathBuf, (u64, u64)> = HashMap::new();
-    let mut selected_files: Vec<FileInfo> = Vec::new();
-    let mut preview_files: Vec<FileInfo> = Vec::new();
-    let mut preview_directories_sent: HashMap<String, (u64, u64)> = HashMap::new();
-    let mut total_logical_size: u64 = 0;
-    let mut total_disk_usage: u64 = 0;
-    let use_disk_mode = size_mode == Some("disk");
-    let mut matched_files_found = 0usize;
-    let preview_limit = limit.unwrap_or(50).max(1);
-    let dir_calc_start = Instant::now();
-    let mut discovered_entries = 0usize;
-    let mut last_progress_emit = Instant::now();
-
     for entry in WalkDir::new(root).follow_links(false).min_depth(1).into_iter() {
         if cancel_flag.load(Ordering::SeqCst) {
             progress_callback(ScanEvent::Cancelled {
@@ -137,205 +50,114 @@ where
             })?;
             return Err("扫描被取消".into());
         }
-        let Ok(entry) = entry else {
-            metrics.skipped_entries += 1;
-            continue;
-        };
 
-        discovered_entries += 1;
-        metrics.total_entries = discovered_entries;
-        let current_path = entry.path().to_string_lossy().to_string();
-
-        let metadata_start = Instant::now();
-        let metadata = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => {
-                metrics.metadata_read_time += metadata_start.elapsed().as_nanos();
-                metrics.skipped_entries += 1;
-                maybe_emit_progress(
-                    &mut progress_callback,
-                    &scan_id,
-                    &mut last_progress_emit,
-                    discovered_entries,
-                    &current_path,
-                )?;
+        let entry = match entry {
+            Ok(e) => e,
+            Err(err) => {
+                scanned_entries += 1;
+                let path = err.path().map(|p| p.to_string_lossy().to_string());
+                record_region(
+                    &mut unscanned_regions,
+                    path,
+                    reason_for_walkdir_error(&err),
+                );
                 continue;
             }
         };
-        metrics.metadata_read_time += metadata_start.elapsed().as_nanos();
+        scanned_entries += 1;
+        let current_path = entry.path().to_string_lossy().to_string();
+
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => {
+                record_region(&mut unscanned_regions, Some(current_path), "metadata-error");
+                continue;
+            }
+        };
 
         if metadata.is_dir() {
-            metrics.dirs_processed += 1;
+            index.insert(entry.path(), true, 0, 0, 0, 0, 0, modified_of(&metadata));
         } else if metadata.is_file() {
-            metrics.files_processed += 1;
+            let size_logical = metadata.len();
+            let size_disk = compute_disk_usage(&metadata);
+            let dev = metadata.dev() as u32;
+            let ino = metadata.ino();
+            let physical_unique = if seen_inodes.insert((dev, ino)) { size_disk } else { 0 };
+            let modified = modified_of(&metadata);
 
-            let size = metadata.len();
-            let disk_usage = compute_disk_usage(size, &metadata);
-            total_logical_size = total_logical_size.saturating_add(size);
-            total_disk_usage = total_disk_usage.saturating_add(disk_usage);
+            index.insert(
+                entry.path(),
+                false,
+                size_logical,
+                size_disk,
+                physical_unique,
+                dev,
+                ino,
+                modified,
+            );
 
-            accumulate_parent_sizes(root, entry.path(), size, disk_usage, &mut dir_sizes);
-
-            let active_size = if use_disk_mode { disk_usage } else { size };
-            if min_size.map_or(true, |min| active_size >= min) {
-                matched_files_found += 1;
-                if let Ok(info) =
-                    create_file_info_from_metadata(entry.path(), size, false, &metadata)
-                {
-                    let preview_item = retain_top_files(
-                        &mut preview_files,
-                        info.clone(),
-                        Some(preview_limit),
-                        use_disk_mode,
-                    );
-                    retain_top_files(&mut selected_files, info, limit, use_disk_mode);
-                    if let Some(file) = preview_item {
-                        progress_callback(ScanEvent::FileFound {
-                            scan_id: scan_id.clone(),
-                            file,
-                        })?;
-                    }
-                }
+            // Bounded live preview of large files.
+            if preview_events_emitted < PREVIEW_EVENT_CAP && size_disk >= PREVIEW_MIN_SIZE {
+                preview_events_emitted += 1;
+                progress_callback(ScanEvent::FileFound {
+                    scan_id: scan_id.clone(),
+                    file: FileInfo {
+                        path: current_path.clone(),
+                        size_logical,
+                        is_dir: false,
+                        modified,
+                        name: entry
+                            .file_name()
+                            .to_string_lossy()
+                            .to_string(),
+                        size_disk,
+                        physical_unique,
+                    },
+                })?;
             }
+
+            accumulate_parent_sizes(root, entry.path(), size_logical, size_disk, &mut dir_agg);
         }
 
-        let progress_emitted = maybe_emit_progress(
+        if maybe_emit_progress(
             &mut progress_callback,
             &scan_id,
             &mut last_progress_emit,
-            discovered_entries,
+            scanned_entries,
             &current_path,
-        )?;
-        if progress_emitted {
-            emit_directory_previews(
+        )? {
+            emit_dir_previews(
                 root,
-                &dir_sizes,
-                min_size,
-                use_disk_mode,
-                preview_limit,
+                &dir_agg,
+                PREVIEW_EVENT_CAP - preview_events_emitted,
                 &scan_id,
-                &mut preview_directories_sent,
+                &mut preview_dirs_sent,
+                &mut preview_events_emitted,
                 &mut progress_callback,
             )?;
         }
     }
 
-    metrics.dir_calc_time = dir_calc_start.elapsed().as_nanos();
+    index.finish();
 
     progress_callback(ScanEvent::Progress {
         scan_id: scan_id.clone(),
-        processed: discovered_entries,
-        discovered: Some(discovered_entries),
-        total_estimated: Some(discovered_entries),
+        processed: scanned_entries,
+        discovered: Some(scanned_entries),
+        total_estimated: Some(scanned_entries),
         current_path: root.to_string_lossy().to_string(),
         phase: Some("processing".to_string()),
     })?;
-    emit_directory_previews(
-        root,
-        &dir_sizes,
-        min_size,
-        use_disk_mode,
-        preview_limit,
-        &scan_id,
-        &mut preview_directories_sent,
-        &mut progress_callback,
-    )?;
 
-    // 收集符合大小要求的目录。前端现在会构建可展开树形表格，
-    // 因此不能再过滤掉已选父目录下面的子项。
-    let mut all_dirs: Vec<(PathBuf, u64, u64)> = dir_sizes
-        .iter()
-        .filter(|(path, _sizes)| *path != root)
-        .filter(|(_path, sizes)| {
-            if let Some(min) = min_size {
-                if use_disk_mode {
-                    sizes.1 >= min
-                } else {
-                    sizes.0 >= min
-                }
-            } else {
-                true
-            }
-        })
-        .map(|(path, sizes)| (path.clone(), sizes.0, sizes.1))
-        .collect::<Vec<_>>();
-
-    let sort_start = Instant::now();
-    let active_tuple_size = |logical: u64, disk: u64| if use_disk_mode { disk } else { logical };
-    all_dirs.sort_by(|a, b| {
-        active_tuple_size(b.1, b.2)
-            .cmp(&active_tuple_size(a.1, a.2))
-            .then_with(|| a.0.cmp(&b.0))
-    });
-
-    selected_files.sort_by(|a, b| compare_file_info(a, b, use_disk_mode));
-
-    let total_files_found = matched_files_found;
-    let total_directories_found = all_dirs.len();
-
-    let mut final_files = selected_files;
-    if let Some(l) = limit {
-        final_files.truncate(l);
-    }
-
-    let selected_dir_entries = if let Some(l) = limit {
-        all_dirs.into_iter().take(l).collect::<Vec<_>>()
-    } else {
-        all_dirs
-    };
-
-    let mut final_dirs: Vec<FileInfo> = selected_dir_entries
-        .into_iter()
-        .filter_map(|(path, size, disk_usage)| {
-            create_file_info_with_sizes(&path, size, disk_usage, true).ok()
-        })
-        .collect();
-
-    let mut result_by_path: HashMap<String, FileInfo> = HashMap::new();
-
-    for dir in &final_dirs {
-        result_by_path.insert(dir.path.clone(), dir.clone());
-        add_ancestor_dirs(Path::new(&dir.path), root, &dir_sizes, &mut result_by_path);
-    }
-
-    for file in &final_files {
-        result_by_path.insert(file.path.clone(), file.clone());
-        add_ancestor_dirs(Path::new(&file.path), root, &dir_sizes, &mut result_by_path);
-    }
-
-    final_dirs = result_by_path
-        .values()
-        .filter(|item| item.is_dir)
-        .cloned()
-        .collect();
-    final_dirs.sort_by(|a, b| compare_file_info(a, b, use_disk_mode));
-    metrics.sorting_time = sort_start.elapsed().as_nanos();
-
-    metrics.finish();
-    metrics.log_summary();
-
-    let total_size = if size_mode == Some("disk") {
-        total_disk_usage
-    } else {
-        total_logical_size
-    };
-
-    let mut results = final_files.clone();
-    results.extend(final_dirs.clone());
-    results.sort_by(|a, b| compare_file_info(a, b, use_disk_mode));
-
-    progress_callback(ScanEvent::Completed {
-        scan_id: scan_id.clone(),
-        files_found: total_files_found,
-        directories_found: total_directories_found,
-        result_count: results.len(),
-        total_size,
-        total_size_logical: total_logical_size,
-        total_size_disk: total_disk_usage,
-        results,
-    })?;
-
-    Ok((final_files, final_dirs, total_size))
+    let partial = !unscanned_regions.is_empty();
+    Ok((
+        index,
+        ScanCoverage {
+            scanned_entries,
+            unscanned_regions,
+            partial,
+        },
+    ))
 }
 
 fn maybe_emit_progress<F>(
@@ -360,8 +182,61 @@ where
         })?;
         return Ok(true);
     }
-
     Ok(false)
+}
+
+fn emit_dir_previews<F>(
+    root: &Path,
+    dir_agg: &HashMap<PathBuf, (u64, u64)>,
+    budget: usize,
+    scan_id: &str,
+    preview_dirs_sent: &mut HashMap<String, (u64, u64)>,
+    preview_events_emitted: &mut usize,
+    progress_callback: &mut F,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: FnMut(ScanEvent) -> Result<(), Box<dyn std::error::Error>>,
+{
+    if budget == 0 {
+        return Ok(());
+    }
+    let mut top: Vec<(&PathBuf, u64, u64)> = dir_agg
+        .iter()
+        .filter(|(p, _)| *p != root)
+        .map(|(p, (l, d))| (p, *l, *d))
+        .collect();
+    top.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(b.0)));
+    for (path, l, d) in top.iter().take(budget) {
+        let key = path.to_string_lossy().to_string();
+        let next_sizes = (*l, *d);
+        let should_emit = preview_dirs_sent
+            .get(&key)
+            .map(|sizes| *sizes != next_sizes)
+            .unwrap_or(true);
+        if should_emit {
+            preview_dirs_sent.insert(key.clone(), next_sizes);
+            *preview_events_emitted += 1;
+            progress_callback(ScanEvent::DirectoryFound {
+                scan_id: scan_id.to_string(),
+                directory: FileInfo {
+                    path: key.clone(),
+                    size_logical: *l,
+                    is_dir: true,
+                    modified: None,
+                    name: path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| key.clone()),
+                    size_disk: *d,
+                    physical_unique: 0,
+                },
+            })?;
+            if *preview_events_emitted >= PREVIEW_EVENT_CAP {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn accumulate_parent_sizes(
@@ -386,248 +261,62 @@ fn accumulate_parent_sizes(
     }
 }
 
-fn compute_disk_usage(size: u64, metadata: &std::fs::Metadata) -> u64 {
+/// Blocks unavailable (0) means the file occupies no allocated blocks; we never
+/// fall back to the logical size (that overstates sparse/empty files).
+fn compute_disk_usage(metadata: &std::fs::Metadata) -> u64 {
     let blocks = metadata.blocks();
     if blocks == 0 {
-        size
+        0
     } else {
         blocks * 512
     }
 }
 
-fn compare_file_info(a: &FileInfo, b: &FileInfo, use_disk_mode: bool) -> std::cmp::Ordering {
-    let a_size = if use_disk_mode {
-        a.size_disk
-    } else {
-        a.size_logical
-    };
-    let b_size = if use_disk_mode {
-        b.size_disk
-    } else {
-        b.size_logical
-    };
-
-    b_size.cmp(&a_size).then_with(|| a.path.cmp(&b.path))
-}
-
-fn retain_top_files(
-    selected_files: &mut Vec<FileInfo>,
-    candidate: FileInfo,
-    limit: Option<usize>,
-    use_disk_mode: bool,
-) -> Option<FileInfo> {
-    let Some(limit) = limit else {
-        selected_files.push(candidate);
-        return selected_files.last().cloned();
-    };
-
-    if limit == 0 {
-        return None;
-    }
-
-    if selected_files.len() < limit {
-        selected_files.push(candidate);
-        return selected_files.last().cloned();
-    }
-
-    let weakest_index = selected_files
-        .iter()
-        .enumerate()
-        .min_by(|(_, a), (_, b)| {
-            let a_size = if use_disk_mode {
-                a.size_disk
-            } else {
-                a.size_logical
-            };
-            let b_size = if use_disk_mode {
-                b.size_disk
-            } else {
-                b.size_logical
-            };
-
-            a_size.cmp(&b_size).then_with(|| b.path.cmp(&a.path))
-        })
-        .map(|(index, _)| index);
-
-    if let Some(index) = weakest_index {
-        if compare_file_info(&candidate, &selected_files[index], use_disk_mode)
-            == std::cmp::Ordering::Less
-        {
-            selected_files[index] = candidate;
-            return Some(selected_files[index].clone());
-        }
-    }
-
-    None
-}
-
-fn emit_directory_previews<F>(
-    root: &Path,
-    dir_sizes: &HashMap<PathBuf, (u64, u64)>,
-    min_size: Option<u64>,
-    use_disk_mode: bool,
-    preview_limit: usize,
-    scan_id: &str,
-    preview_directories_sent: &mut HashMap<String, (u64, u64)>,
-    progress_callback: &mut F,
-) -> Result<(), Box<dyn std::error::Error>>
-where
-    F: FnMut(ScanEvent) -> Result<(), Box<dyn std::error::Error>>,
-{
-    let preview_dirs = collect_preview_directories(
-        root,
-        dir_sizes,
-        min_size,
-        use_disk_mode,
-        preview_limit,
-    );
-
-    for directory in preview_dirs {
-        let next_sizes = (directory.size_logical, directory.size_disk);
-        let should_emit = preview_directories_sent
-            .get(&directory.path)
-            .map(|sizes| *sizes != next_sizes)
-            .unwrap_or(true);
-        if should_emit {
-            preview_directories_sent.insert(directory.path.clone(), next_sizes);
-            progress_callback(ScanEvent::DirectoryFound {
-                scan_id: scan_id.to_string(),
-                directory,
-            })?;
-        }
-    }
-
-    Ok(())
-}
-
-fn collect_preview_directories(
-    root: &Path,
-    dir_sizes: &HashMap<PathBuf, (u64, u64)>,
-    min_size: Option<u64>,
-    use_disk_mode: bool,
-    preview_limit: usize,
-) -> Vec<FileInfo> {
-    let mut preview_dirs = dir_sizes
-        .iter()
-        .filter(|(path, _)| *path != root)
-        .filter(|(_, sizes)| {
-            if let Some(min) = min_size {
-                if use_disk_mode {
-                    sizes.1 >= min
-                } else {
-                    sizes.0 >= min
-                }
-            } else {
-                true
-            }
-        })
-        .filter_map(|(path, sizes)| {
-            create_file_info_with_sizes(path, sizes.0, sizes.1, true).ok()
-        })
-        .collect::<Vec<_>>();
-
-    preview_dirs.sort_by(|a, b| compare_file_info(a, b, use_disk_mode));
-    preview_dirs.truncate(preview_limit);
-    preview_dirs
-}
-
-fn add_ancestor_dirs(
-    item_path: &Path,
-    root: &Path,
-    dir_sizes: &HashMap<PathBuf, (u64, u64)>,
-    result_by_path: &mut HashMap<String, FileInfo>,
-) {
-    let mut current = item_path.parent();
-
-    while let Some(parent) = current {
-        if parent == root || !parent.starts_with(root) {
-            break;
-        }
-
-        if let Some((size_logical, size_disk)) = dir_sizes.get(parent) {
-            if let Ok(info) = create_file_info_with_sizes(parent, *size_logical, *size_disk, true)
-            {
-                result_by_path.entry(info.path.clone()).or_insert(info);
-            }
-        }
-
-        current = parent.parent();
-    }
-}
-
-/// 辅助函数：创建 FileInfo
-fn create_file_info_from_metadata(
-    path: &Path,
-    size: u64,
-    is_dir: bool,
-    metadata: &std::fs::Metadata,
-) -> Result<FileInfo, Box<dyn std::error::Error>> {
-    let modified = metadata
+fn modified_of(metadata: &std::fs::Metadata) -> Option<u64> {
+    metadata
         .modified()
         .ok()
-        .map(|t| t.duration_since(UNIX_EPOCH).unwrap().as_secs());
-
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.to_string_lossy().to_string());
-
-    let disk_usage = compute_disk_usage(size, metadata);
-
-    Ok(FileInfo {
-        path: path.to_string_lossy().to_string(),
-        size_logical: size,
-        is_dir,
-        modified,
-        name,
-        size_disk: disk_usage,
-    })
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
 }
 
-fn create_file_info_with_sizes(
-    path: &Path,
-    size_logical: u64,
-    size_disk: u64,
-    is_dir: bool,
-) -> Result<FileInfo, Box<dyn std::error::Error>> {
-    match std::fs::metadata(path) {
-        Ok(metadata) => {
-            let modified = metadata
-                .modified()
-                .ok()
-                .map(|t| t.duration_since(UNIX_EPOCH).unwrap().as_secs());
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| path.to_string_lossy().to_string());
-            Ok(FileInfo {
-                path: path.to_string_lossy().to_string(),
-                size_logical,
-                is_dir,
-                modified,
-                name,
-                size_disk,
-            })
-        }
-        Err(_) => Ok(FileInfo {
-            path: path.to_string_lossy().to_string(),
-            size_logical,
-            is_dir,
-            modified: None,
-            name: path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default(),
-            size_disk,
-        }),
+fn reason_for_walkdir_error(err: &walkdir::Error) -> &'static str {
+    if err.loop_ancestor().is_some() {
+        "symlink-loop"
+    } else if err
+        .io_error()
+        .map(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
+        .unwrap_or(false)
+    {
+        "permission-denied"
+    } else {
+        "io-error"
     }
+}
+
+/// Record a region as unscanned, keeping only top-level failing paths.
+fn record_region(regions: &mut Vec<UnscannedRegion>, path: Option<String>, reason: &str) {
+    let Some(path) = path else { return };
+    let path = normalize_path(&path);
+    if regions
+        .iter()
+        .any(|r| path == r.path || path.starts_with(&format!("{}/", r.path)))
+    {
+        return;
+    }
+    regions.retain(|r| !r.path.starts_with(&format!("{}/", path)));
+    regions.push(UnscannedRegion {
+        path,
+        reason: reason.to_string(),
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::{FlatQuery, KindFilter, ModifiedWindow, SizeMode, SortKey};
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::AtomicBool;
 
     struct TestDir {
         path: PathBuf,
@@ -635,7 +324,7 @@ mod tests {
 
     impl TestDir {
         fn new(name: &str) -> Self {
-            let unique = SystemTime::now()
+            let unique = std::time::SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
@@ -665,147 +354,312 @@ mod tests {
         }
     }
 
-    fn find_item<'a>(items: &'a [FileInfo], path: &Path) -> &'a FileInfo {
-        let path = path.to_string_lossy();
-        items
-            .iter()
-            .find(|item| item.path == path)
-            .unwrap_or_else(|| panic!("missing item: {}", path))
+    fn scan(dir: &Path) -> ScanIndex {
+        let cancel = Arc::new(AtomicBool::new(false));
+        scan_directory_with_progress(dir, cancel, "test".to_string(), |_| Ok(()))
+            .unwrap()
+            .0
+    }
+
+    fn flat_files(index: &ScanIndex, min_size: Option<u64>) -> Vec<FileInfo> {
+        let q = FlatQuery {
+            min_size,
+            modified_window: ModifiedWindow::All,
+            search_query: None,
+            kind: KindFilter::Files,
+            type_filter: None,
+            sort: SortKey::Size,
+            sort_desc: true,
+            size_mode: SizeMode::Logical,
+            offset: 0,
+            limit: crate::index::MAX_PAGE_SIZE,
+        };
+        index.query_flat(&q).items
     }
 
     #[test]
-    fn scan_returns_files_directories_and_total_logical_size() {
-        let dir = TestDir::new("totals");
-        let file_a = dir.write_file("alpha.bin", 12);
-        let nested_file = dir.write_file("nested/beta.bin", 30);
-        let nested_dir = dir.path.join("nested");
-
-        let results = scan_directory(&dir.path, None, None, Some("logical")).unwrap();
-
-        let alpha = find_item(&results, &file_a);
-        assert!(!alpha.is_dir);
-        assert_eq!(alpha.size_logical, 12);
-        assert!(alpha.size_disk >= alpha.size_logical);
-
-        let beta = find_item(&results, &nested_file);
-        assert!(!beta.is_dir);
-        assert_eq!(beta.size_logical, 30);
-
-        let nested = find_item(&results, &nested_dir);
-        assert!(nested.is_dir);
-        assert_eq!(nested.size_logical, 30);
-        assert!(nested.size_disk >= nested.size_logical);
+    fn scan_keeps_all_files_beyond_old_display_cap() {
+        let dir = TestDir::new("all_files");
+        let mut expected: Vec<PathBuf> = Vec::new();
+        for i in 0..250 {
+            expected.push(dir.write_file(&format!("f{:03}.bin", i), 10 + (i % 5)));
+        }
+        let index = scan(&dir.path);
+        let files = flat_files(&index, None);
+        assert_eq!(files.len(), 250);
+        for path in &expected {
+            assert!(files.iter().any(|f| f.path == path.to_string_lossy()), "missing {}", path.display());
+        }
     }
 
     #[test]
-    fn min_size_filter_uses_selected_size_mode_for_files_and_dirs() {
-        let dir = TestDir::new("min_size");
-        let small_file = dir.write_file("small.bin", 8);
-        let large_file = dir.write_file("folder/large.bin", 64);
-        let folder = dir.path.join("folder");
+    fn directory_aggregates_are_complete_regardless_of_filter() {
+        let dir = TestDir::new("agg_complete");
+        dir.write_file("a.bin", 12);
+        dir.write_file("nested/b.bin", 30);
+        dir.write_file("nested/deep/c.bin", 58);
+        let index = scan(&dir.path);
 
-        let results = scan_directory(&dir.path, None, Some(32), Some("logical")).unwrap();
+        let (nested_l, _nested_d) = index
+            .query_dir_size(&dir.path.join("nested").to_string_lossy())
+            .unwrap();
+        assert_eq!(nested_l, 88);
 
-        assert!(results
-            .iter()
-            .all(|item| item.path != small_file.to_string_lossy()));
-        assert!(results
-            .iter()
-            .any(|item| item.path == large_file.to_string_lossy()));
-        assert!(results
-            .iter()
-            .any(|item| item.path == folder.to_string_lossy()));
+        let (root_l, _) = index.query_dir_size(&dir.path.to_string_lossy()).unwrap();
+        assert_eq!(root_l, 100);
+
+        // minSize filter on query does not change aggregates.
+        let _ = flat_files(&index, Some(50));
+        let (root_l2, _) = index.query_dir_size(&dir.path.to_string_lossy()).unwrap();
+        assert_eq!(root_l2, 100);
     }
 
     #[test]
-    fn limited_results_include_ancestors_for_tree_rendering() {
-        let dir = TestDir::new("ancestors");
-        let large_file = dir.write_file("a/b/c/large.bin", 128);
-        let small_file = dir.write_file("z/small.bin", 1);
-        let ancestor_a = dir.path.join("a");
-        let ancestor_b = dir.path.join("a/b");
-        let ancestor_c = dir.path.join("a/b/c");
+    fn min_size_is_query_filter_only_and_mode_independent() {
+        let dir = TestDir::new("mode_indep");
+        // sparse-like: small disk, large logical is hard to simulate; use normal files.
+        dir.write_file("big.bin", 100);
+        dir.write_file("small.bin", 8);
+        let index = scan(&dir.path);
 
-        let results = scan_directory(&dir.path, Some(1), Some(2), Some("logical")).unwrap();
+        // Logical-mode filter of 20 should find big.bin only.
+        let q = FlatQuery {
+            min_size: Some(20),
+            modified_window: ModifiedWindow::All,
+            search_query: None,
+            kind: KindFilter::Files,
+            type_filter: None,
+            sort: SortKey::Size,
+            sort_desc: true,
+            size_mode: SizeMode::Logical,
+            offset: 0,
+            limit: crate::index::MAX_PAGE_SIZE,
+        };
+        let items = index.query_flat(&q).items;
+        assert_eq!(items.len(), 1);
+        assert!(items[0].name == "big.bin");
 
-        assert!(results
-            .iter()
-            .any(|item| item.path == large_file.to_string_lossy()));
-        assert!(!results
-            .iter()
-            .any(|item| item.path == small_file.to_string_lossy()));
-        assert!(results
-            .iter()
-            .any(|item| item.path == ancestor_a.to_string_lossy()));
-        assert!(results
-            .iter()
-            .any(|item| item.path == ancestor_b.to_string_lossy()));
-        assert!(results
-            .iter()
-            .any(|item| item.path == ancestor_c.to_string_lossy()));
+        // Disk-mode filter of 20 must still find big.bin (no scan-time pruning).
+        let q2 = FlatQuery { size_mode: SizeMode::Disk, ..q };
+        let items2 = index.query_flat(&q2).items;
+        assert!(items2.iter().any(|f| f.name == "big.bin"));
     }
 
     #[test]
-    fn file_limit_keeps_largest_matching_files() {
-        let dir = TestDir::new("topk");
-        let _small = dir.write_file("small.bin", 8);
-        let medium = dir.write_file("medium.bin", 64);
-        let large = dir.write_file("large.bin", 128);
+    fn subtree_returns_children_sorted_and_paginated() {
+        let dir = TestDir::new("subtree");
+        dir.write_file("small.bin", 8);
+        dir.write_file("big.bin", 64);
+        dir.write_file("mid.bin", 32);
+        let index = scan(&dir.path);
 
-        let results = scan_directory(&dir.path, Some(2), None, Some("logical")).unwrap();
-        let file_paths = results
-            .iter()
-            .filter(|item| !item.is_dir)
-            .map(|item| item.path.clone())
-            .collect::<Vec<_>>();
+        let page = index.query_subtree(&dir.path.to_string_lossy(), SizeMode::Logical, 0, 2);
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.total, 3);
+        assert!(page.has_more);
+        assert_eq!(page.items[0].name, "big.bin");
+        assert_eq!(page.items[1].name, "mid.bin");
 
-        assert_eq!(file_paths.len(), 2);
-        assert!(file_paths.contains(&medium.to_string_lossy().to_string()));
-        assert!(file_paths.contains(&large.to_string_lossy().to_string()));
+        let page2 = index.query_subtree(&dir.path.to_string_lossy(), SizeMode::Logical, 2, 2);
+        assert_eq!(page2.items.len(), 1);
+        assert!(!page2.has_more);
     }
 
     #[test]
-    fn progress_scan_emits_preview_events_before_completion() {
-        let dir = TestDir::new("preview_events");
-        dir.write_file("alpha.bin", 64);
-        dir.write_file("nested/beta.bin", 96);
+    fn delete_removes_subtree_and_recomputes_totals() {
+        let dir = TestDir::new("delete_consist");
+        dir.write_file("a.bin", 10);
+        dir.write_file("keep.bin", 50);
+        dir.write_file("gone/deep/removed.bin", 40);
+        let mut index = scan(&dir.path);
 
-        let cancel_flag = Arc::new(AtomicBool::new(false));
-        let mut events = Vec::new();
+        let root_before = index.query_dir_size(&dir.path.to_string_lossy()).unwrap().0;
+        assert_eq!(root_before, 100);
 
-        let result = scan_directory_with_progress(
-            &dir.path,
-            Some(5),
-            None,
-            cancel_flag,
-            "test-scan".to_string(),
-            Some("logical"),
-            |event| {
-                events.push(event);
-                Ok(())
-            },
+        let removed = index.delete_subtree(&dir.path.join("gone").to_string_lossy()).unwrap();
+        assert_eq!(removed.0, 40); // removed logical size
+
+        let root_after = index.query_dir_size(&dir.path.to_string_lossy()).unwrap().0;
+        assert_eq!(root_after, 60);
+
+        // Deleted subtree no longer reachable.
+        let gone_children = index.query_subtree(&dir.path.to_string_lossy(), SizeMode::Logical, 0, 500);
+        assert!(gone_children.items.iter().all(|f| !f.path.contains("gone")));
+        assert!(index.query_dir_size(&dir.path.join("gone").to_string_lossy()).is_none());
+
+        // Insights recomputed.
+        let summary = index.summary();
+        assert_eq!(summary.total_size_logical, 60);
+        assert_eq!(summary.files_scanned, 2);
+    }
+
+    #[test]
+    fn pagination_is_stable_for_equal_sized_files() {
+        let dir = TestDir::new("stable_page");
+        for i in 0..30 {
+            dir.write_file(&format!("f{:02}.bin", i), 100);
+        }
+        let index = scan(&dir.path);
+
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut offset = 0usize;
+        loop {
+            let page = index.query_flat(&FlatQuery {
+                min_size: None,
+                modified_window: ModifiedWindow::All,
+                search_query: None,
+                kind: KindFilter::Files,
+                type_filter: None,
+                sort: SortKey::Size,
+                sort_desc: true,
+                size_mode: SizeMode::Logical,
+                offset,
+                limit: 7,
+            });
+            for item in &page.items {
+                assert!(seen.insert(item.path.clone()), "duplicate across pages: {}", item.path);
+            }
+            if !page.has_more {
+                break;
+            }
+            offset += 7;
+        }
+        assert_eq!(seen.len(), 30);
+    }
+
+    #[test]
+    fn type_filter_applies_across_all_pages() {
+        let dir = TestDir::new("type_filter");
+        dir.write_file("video.mp4", 40);
+        dir.write_file("photo.jpg", 20);
+        dir.write_file("audio.mp3", 30);
+        let index = scan(&dir.path);
+
+        let q = FlatQuery {
+            min_size: None,
+            modified_window: ModifiedWindow::All,
+            search_query: None,
+            kind: KindFilter::Files,
+            type_filter: Some("视频".to_string()),
+            sort: SortKey::Size,
+            sort_desc: true,
+            size_mode: SizeMode::Logical,
+            offset: 0,
+            limit: crate::index::MAX_PAGE_SIZE,
+        };
+        let items = index.query_flat(&q).items;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "video.mp4");
+    }
+
+    fn scan_with_coverage(dir: &Path) -> (ScanIndex, ScanCoverage) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        scan_directory_with_progress(dir, cancel, "test".to_string(), |_| Ok(())).unwrap()
+    }
+
+    #[test]
+    fn physical_unique_dedupes_hardlinks() {
+        let dir = TestDir::new("hardlink");
+        let original = dir.write_file("orig.bin", 64);
+        let link = dir.path.join("link.bin");
+        fs::hard_link(&original, &link).unwrap();
+
+        let index = scan(&dir.path);
+        let files = flat_files(&index, None);
+        assert_eq!(files.len(), 2);
+
+        let summary = index.summary();
+        // Allocated disk counts both links; the deduplicated total counts one inode.
+        assert!(summary.total_size_disk > 0);
+        assert!(summary.physical_unique_total > 0);
+        assert!(summary.physical_unique_total < summary.total_size_disk);
+        // Per-file dedup: one path carries the bytes, the other zero.
+        let nonzero = files
+            .iter()
+            .filter(|f| f.physical_unique > 0)
+            .count();
+        assert_eq!(nonzero, 1);
+    }
+
+    #[test]
+    fn permission_denied_dirs_are_recorded_as_unscanned() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TestDir::new("coverage");
+        dir.write_file("ok.bin", 10);
+        let locked = dir.path.join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(locked.join("hidden.bin"), vec![0u8; 16]).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let (_index, coverage) = scan_with_coverage(&dir.path);
+        // Restore permissions so the temp dir can be cleaned up.
+        let _ = fs::set_permissions(&locked, fs::Permissions::from_mode(0o755));
+
+        assert!(coverage.partial);
+        assert!(coverage.unscanned_regions.iter().any(|r| {
+            r.path.ends_with("locked") && r.reason == "permission-denied"
+        }));
+    }
+
+    #[test]
+    fn rust_category_matches_frontend_taxonomy() {
+        // Mirrors the bucket set in src/scanInsights.ts categorizeFile.
+        let file_cases = [
+            ("video.mp4", "视频"),
+            ("photo.JPG", "图片"),
+            ("song.mp3", "音频"),
+            ("doc.pdf", "文档"),
+            ("archive.tar.gz", "归档文件"),
+            ("installer.dmg", "应用"),
+            ("db.sqlite", "数据库"),
+            ("design.psd", "设计文件"),
+            ("disk.iso", "磁盘镜像"),
+            ("random.bin", "其他文件"),
+        ];
+        for (name, expected) in file_cases {
+            assert_eq!(
+                crate::index::categorize_file(name, "/x/placeholder", false).as_deref(),
+                Some(expected),
+                "file {name}"
+            );
+        }
+        assert_eq!(
+            crate::index::categorize_file("Foo.app", "/x/Foo.app", true).as_deref(),
+            Some("应用")
         );
+        assert_eq!(
+            crate::index::categorize_file("node_modules", "/x/node_modules", true).as_deref(),
+            Some("Node 模块")
+        );
+        assert_eq!(
+            crate::index::categorize_file("caches", "/x/caches", true).as_deref(),
+            Some("缓存目录")
+        );
+        assert_eq!(
+            crate::index::categorize_file("Anything", "/x/Library/Caches/foo", true).as_deref(),
+            Some("缓存目录")
+        );
+        assert_eq!(
+            crate::index::categorize_file("DerivedData", "/x/DerivedData/sub", true).as_deref(),
+            Some("Xcode 缓存")
+        );
+        assert_eq!(crate::index::categorize_file("src", "/x/src", true), None);
+    }
 
-        assert!(result.is_ok());
-        assert!(events.iter().any(|event| matches!(event, ScanEvent::FileFound { .. })));
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, ScanEvent::DirectoryFound { .. })));
+    #[test]
+    fn insights_reflect_complete_index() {
+        let dir = TestDir::new("insights");
+        dir.write_file("small.txt", 10);
+        dir.write_file("big.mkv", 5000);
+        dir.write_file("photo.jpg", 300);
+        let index = scan(&dir.path);
 
-        let completed_index = events
-            .iter()
-            .position(|event| matches!(event, ScanEvent::Completed { .. }))
-            .expect("completed event missing");
-        let preview_index = events
-            .iter()
-            .position(|event| {
-                matches!(
-                    event,
-                    ScanEvent::FileFound { .. } | ScanEvent::DirectoryFound { .. }
-                )
-            })
-            .expect("preview event missing");
-
-        assert!(preview_index < completed_index);
+        let s = index.summary();
+        assert_eq!(s.files_scanned, 3);
+        let largest = s.insights.largest_file.unwrap();
+        assert!(largest.path.ends_with("big.mkv"));
+        let top = s.insights.top_types.iter().next().unwrap();
+        assert_eq!(top.label, "视频");
+        assert_eq!(top.count, 1);
     }
 }

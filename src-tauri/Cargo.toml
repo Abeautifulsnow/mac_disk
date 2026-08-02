@@ -24,6 +24,10 @@ lru = "0.12"     # LRU缓存
 uuid = { version = "1.10", features = ["v4", "serde"] }
 tokio = { version = "1.0", features = ["sync", "rt-multi-thread"] }
 
+[dev-dependencies]
+# Enables tauri::test (mock_builder / noop_assets) for command-layer tests.
+tauri = { version = "2.0", features = ["test"] }
+
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]

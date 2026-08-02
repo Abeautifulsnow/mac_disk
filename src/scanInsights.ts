@@ -2,17 +2,15 @@ import type { FileInfo } from "./types";
 
 export type SizeMode = "logical" | "disk";
 
-export interface TypeBucket {
-  label: string;
-  totalSize: number;
-  count: number;
-  samplePath: string;
-}
-
 export function getSizeValue(file: FileInfo, sizeMode: SizeMode) {
   return sizeMode === "disk" ? file.sizeDisk : file.sizeLogical;
 }
 
+/**
+ * Frontend mirror of the Rust type taxonomy (src-tauri/src/index.rs
+ * `categorize_file`). Kept for interactive type badges; the authoritative
+ * bucket computation happens server-side over the complete index.
+ */
 export function categorizeFile(item: FileInfo): string | null {
   const lowerName = item.name.toLowerCase();
   const lowerPath = item.path.toLowerCase();
@@ -47,32 +45,4 @@ export function categorizeFile(item: FileInfo): string | null {
   if (["sql", "db", "sqlite", "sqlite3"].includes(ext)) return "数据库";
   if (["iso"].includes(ext)) return "磁盘镜像";
   return "其他文件";
-}
-
-export function buildTypeBuckets(files: FileInfo[], sizeMode: SizeMode) {
-  const typeBuckets = new Map<string, TypeBucket>();
-
-  for (const item of files) {
-    const category = categorizeFile(item);
-    if (!category) continue;
-
-    const current = typeBuckets.get(category);
-    const itemSize = getSizeValue(item, sizeMode);
-    if (current) {
-      current.totalSize += itemSize;
-      current.count += 1;
-      continue;
-    }
-
-    typeBuckets.set(category, {
-      label: category,
-      totalSize: itemSize,
-      count: 1,
-      samplePath: item.path,
-    });
-  }
-
-  return Array.from(typeBuckets.values()).sort(
-    (a, b) => b.totalSize - a.totalSize || a.label.localeCompare(b.label),
-  );
 }

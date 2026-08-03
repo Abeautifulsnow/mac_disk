@@ -3,6 +3,7 @@ import { Loader2 } from "lucide-react";
 
 import { queryDirSize, querySubtree } from "../scanApi";
 import { categorizeFile } from "../scanInsights";
+import { formatFileSize } from "../lib/format";
 import { aggregateToCap, squarify, type TreemapRect } from "../squarify";
 import type { FileInfo } from "../types";
 
@@ -10,7 +11,6 @@ interface TreemapViewProps {
   scanId: string | null;
   viewPath: string;
   sizeMode: "logical" | "disk";
-  formatFileSize: (bytes: number) => string;
   isPreview: boolean;
   previewItems: FileInfo[];
   selectedPaths: Set<string>;
@@ -72,7 +72,6 @@ export default function TreemapView({
   scanId,
   viewPath,
   sizeMode,
-  formatFileSize,
   isPreview,
   previewItems,
   selectedPaths,

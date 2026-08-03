@@ -262,15 +262,17 @@ export default function Scanner({ onScan, onCancel, loading, cancelPending = fal
           </p>
         </div>
 
-        <div className="rounded-lg bg-blue-50 p-4">
-          <h4 className="text-sm font-medium text-blue-800 mb-2">扫描提示</h4>
-          <ul className="text-xs text-blue-700 space-y-1">
+        <details className="rounded-lg bg-blue-50 p-4">
+          <summary className="cursor-pointer text-sm font-medium text-blue-800">
+            扫描提示
+          </summary>
+          <ul className="mt-2 text-xs text-blue-700 space-y-1">
             <li>• 避免扫描系统根目录，选择用户目录进行扫描</li>
             <li>• 扫描会保留全部文件记录，大小筛选在平铺视图中进行</li>
             <li>• 扫描大目录时请耐心等待</li>
             <li>• 删除操作移入废纸篓，可恢复；清空废纸篓后不可恢复</li>
           </ul>
-        </div>
+        </details>
       </div>
     </div>
   )

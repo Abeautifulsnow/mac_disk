@@ -1,4 +1,5 @@
 import { AlertTriangle, Trash2, X } from 'lucide-react'
+import { formatFileSize } from '../lib/format'
 import { FileInfo } from '../types'
 
 interface ConfirmDialogProps {
@@ -7,7 +8,6 @@ interface ConfirmDialogProps {
   onConfirm: () => void
   file: FileInfo | null
   batchFiles?: FileInfo[] | null
-  formatFileSize: (bytes: number) => string
   sizeMode: "logical" | "disk"
 }
 
@@ -19,7 +19,6 @@ export default function ConfirmDialog({
   onConfirm,
   file,
   batchFiles,
-  formatFileSize,
   sizeMode
 }: ConfirmDialogProps) {
   const hasBatch = !!batchFiles && batchFiles.length > 0

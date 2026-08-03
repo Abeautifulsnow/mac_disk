@@ -7,13 +7,13 @@ import {
   Sparkles,
 } from "lucide-react";
 
+import { formatFileSize } from "../lib/format";
 import type { Insights, InsightPick } from "../types";
 import type { SizeMode } from "../scanInsights";
 
 interface ScanInsightsProps {
   insights: Insights;
   sizeMode: SizeMode;
-  formatFileSize: (bytes: number) => string;
   onFocusPath: (path: string) => void;
   activeTypeFilter: string | null;
   onTypeFilterChange: (type: string | null) => void;
@@ -61,7 +61,6 @@ function toCards(insights: Insights): InsightCard[] {
 export default function ScanInsights({
   insights,
   sizeMode,
-  formatFileSize,
   onFocusPath,
   activeTypeFilter,
   onTypeFilterChange,
@@ -74,7 +73,7 @@ export default function ScanInsights({
 
   return (
     <section className="mb-4 overflow-hidden rounded-xl border border-gray-200 bg-white">
-      <div className="border-b border-gray-200 bg-gray-50 px-6 py-4">
+      <div className="border-b border-gray-200 bg-gray-50 px-5 py-3.5">
         <div className="flex flex-col gap-2 xl:flex-row xl:items-start xl:justify-between">
           <div>
             <h2 className="flex items-center gap-2 text-lg font-semibold text-gray-900">
@@ -91,7 +90,7 @@ export default function ScanInsights({
         </div>
       </div>
 
-      <div className="space-y-6 px-6 py-5">
+      <div className="space-y-5 px-5 py-4">
         {cards.length > 0 && (
           <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
             {cards.map((card, index) => {
